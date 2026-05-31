@@ -12,6 +12,9 @@ from typing import Any
 
 from flask import Flask, Response, redirect, render_template_string, request, url_for
 
+from dotenv import load_dotenv
+load_dotenv()
+
 
 app = Flask(__name__)
 
