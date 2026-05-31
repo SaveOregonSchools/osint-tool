@@ -6,30 +6,22 @@ __pycache__/
 venv/
 .venv/
 
-# Secrets
+# Environment variables / secrets
 .env
-config_local.py
-credentials.json
-cookies.txt
 
 # Databases
 *.db
 *.sqlite
 *.sqlite3
 
-# Downloads and exports
-downloads/
-exports/
-reports/
-cache/
-
 # Logs
 *.log
-
-# IDE files
-.vscode/
-.idea/
 
 # OS files
 Thumbs.db
 .DS_Store
+
+# Application output
+downloads/
+exports/
+cache/
