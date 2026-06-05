@@ -177,6 +177,9 @@ HTML = """
 
   {% if headers and rows is not none %}
     <p class="subtle">Showing up to <b>{{ (form or {}).get('_limit','500') }}</b> rows. Preview contains <b>{{ len(rows) }}</b> rows.</p>
+    {% if result_actions %}
+      {{ result_actions | safe }}
+    {% endif %}
     <div class="results">
       <table>
         <thead><tr>{% for h in headers %}<th>{{ h }}</th>{% endfor %}</tr></thead>
@@ -222,6 +225,7 @@ def home():
         headers=None,
         rows=None,
         error=None,
+        result_actions="",
         len=len,
     )
 
@@ -247,6 +251,7 @@ def select():
         headers=None,
         rows=None,
         error=None,
+        result_actions="",
         len=len,
     )
 
@@ -266,6 +271,7 @@ def run():
     error = None
     headers, rows = None, None
 
+    result_actions_html = ""
     try:
         headers, rows = REGISTRY[qkey].run(form)
         try:
@@ -273,6 +279,11 @@ def run():
         except Exception:
             lim = 500
         rows = rows[:lim]
+        if hasattr(REGISTRY[qkey], "result_actions"):
+            try:
+                result_actions_html = REGISTRY[qkey].result_actions(form, headers, rows)
+            except Exception:
+                result_actions_html = ""
     except Exception:
         error = traceback.format_exc()
 
@@ -284,8 +295,30 @@ def run():
         headers=headers,
         rows=rows,
         error=error,
+        result_actions=result_actions_html,
         len=len,
     )
+
+
+@app.route("/plugin_action", methods=["POST"])
+def plugin_action():
+    ensure_registry()
+    qkey = request.form.get("qkey")
+    if qkey not in REGISTRY:
+        return "Unknown query key.", 400
+    mod = REGISTRY[qkey]
+    if not hasattr(mod, "handle_action"):
+        return "This plugin does not support actions.", 400
+    try:
+        message = mod.handle_action(request.form.to_dict(flat=True))
+        return (
+            '<!doctype html><title>Action complete</title>'
+            '<body style="font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:900px;margin:32px auto;padding:0 16px;">'
+            '<h2>Action complete</h2><p>' + str(message) + '</p>'
+            '<p><a href="/">Return to query console</a></p></body>'
+        )
+    except Exception:
+        return "<pre>" + traceback.format_exc() + "</pre>", 500
 
 
 @app.route("/export", methods=["GET", "POST"])

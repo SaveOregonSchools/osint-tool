@@ -1,5 +1,5 @@
 """
-LinkedIn Evidence Capture v1
+LinkedIn Evidence Capture v1.1
 
 Drop-in query plugin for the Flask Social OSINT query console.
 
@@ -28,8 +28,11 @@ import csv
 import html
 import io
 import json
+import os
+import platform
 import re
 import sqlite3
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -46,7 +49,7 @@ except Exception:  # pragma: no cover - lets plugin load before dependency insta
 
 META = {
     "key": "linkedin_evidence_capture_v1",
-    "name": "LinkedIn Evidence Capture v1",
+    "name": "LinkedIn Evidence Capture v1.1",
     "description": (
         "Browser-assisted LinkedIn evidence capture. Upload or paste CSV rows with names and "
         "LinkedIn URLs. The module opens a visible browser so you can log in and complete any "
@@ -337,8 +340,18 @@ def render_fields(form: Dict[str, Any]) -> str:
       <textarea id="csv_text" name="csv_text" style="min-height:150px" placeholder="person_name,linkedin_url,notes&#10;Stephen Abbott,https://www.linkedin.com/in/stephen-e-abbott/,sample">{html.escape(str(form.get('csv_text','') or ''))}</textarea>
     </div>
 
+    <div class="row" style="border:1px solid #ddd; border-radius:8px; padding:10px; background:#fbfbfb;">
+      <label style="margin-bottom:8px;"><b>Detailed Captures</b></label>
+      <div class="grid">
+        <label><input type="checkbox" name="capture_experience" value="1" {'checked' if _truthy(form.get('capture_experience', '1')) else ''}> Experience</label>
+        <label><input type="checkbox" name="capture_education" value="1" {'checked' if _truthy(form.get('capture_education', '1')) else ''}> Education</label>
+        <label><input type="checkbox" name="capture_volunteering" value="1" {'checked' if _truthy(form.get('capture_volunteering', '1')) else ''}> Volunteering</label>
+        <label><input type="checkbox" name="capture_certifications" value="1" {'checked' if _truthy(form.get('capture_certifications', '1')) else ''}> Licenses &amp; certifications</label>
+      </div>
+      <div class="subtle">Main profile page is always captured. These checkboxes control which detail pages are also captured.</div>
+    </div>
+
     <div class="row">
-      <label><input type="checkbox" name="capture_detail_pages" value="1" {'checked' if _truthy(form.get('capture_detail_pages', '1')) else ''}> Capture Experience, Education, Volunteering, and Licenses & certifications detail pages</label>
       <label><input type="checkbox" name="save_screenshots" value="1" {'checked' if _truthy(form.get('save_screenshots', '1')) else ''}> Save screenshots as well as HTML</label>
       <label><input type="checkbox" name="headless" value="1" {'checked' if _truthy(form.get('headless', '0')) else ''}> Run headless; not recommended because login/2FA usually requires a visible browser</label>
     </div>
@@ -546,7 +559,15 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
     login_wait_seconds = _safe_int(form.get("login_wait_seconds", "900"), 900)
     max_scrolls = _safe_int(form.get("max_scrolls", "18"), 18)
     scroll_pause = _safe_float(form.get("scroll_pause_seconds", "2"), 2.0)
-    capture_detail_pages = _truthy(form.get("capture_detail_pages", "1"))
+    selected_detail_sections = []
+    if _truthy(form.get("capture_experience", "1")):
+        selected_detail_sections.append(("experience", "experience"))
+    if _truthy(form.get("capture_education", "1")):
+        selected_detail_sections.append(("education", "education"))
+    if _truthy(form.get("capture_volunteering", "1")):
+        selected_detail_sections.append(("volunteering", "volunteering-experiences"))
+    if _truthy(form.get("capture_certifications", "1")):
+        selected_detail_sections.append(("certifications", "certifications"))
     save_screenshots = _truthy(form.get("save_screenshots", "1"))
     headless = _truthy(form.get("headless", "0"))
 
@@ -558,7 +579,7 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO evidence_runs (run_id, created_at, source_label, target_count, notes) VALUES (?,?,?,?,?)",
-            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1"),
+            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.1"),
         )
 
     with sync_playwright() as p:
@@ -580,9 +601,7 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
             paths: Dict[str, Dict[str, str]] = {}
             errors: List[str] = []
 
-            sections = [("main", "")]
-            if capture_detail_pages:
-                sections += [(name, slug) for name, slug in SECTION_SPECS if name != "main"]
+            sections = [("main", "")] + selected_detail_sections
 
             for section_name, section_slug in sections:
                 url = detail_url(target.linkedin_url, section_slug)
@@ -607,7 +626,10 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
             rows.append(row)
             save_row_to_db(run_id, row)
 
-    write_manifest(run_dir, rows)
+    manifest_path = write_manifest(run_dir, rows)
+    # Mutate the form dict so patched app.py can render a post-run action button.
+    form["_lec_last_run_dir"] = _short_path(run_dir)
+    form["_lec_last_manifest"] = _short_path(manifest_path)
     return HEADERS, rows
 
 
@@ -617,3 +639,76 @@ def export_rows(form: Dict[str, Any]) -> Iterable[List[str]]:
     yield headers
     for row in rows:
         yield row
+
+
+def _latest_run_dir() -> Optional[Path]:
+    try:
+        if not RUNS_DIR.exists():
+            return None
+        dirs = [p for p in RUNS_DIR.iterdir() if p.is_dir()]
+        if not dirs:
+            return None
+        return max(dirs, key=lambda p: p.stat().st_mtime)
+    except Exception:
+        return None
+
+
+def _resolve_safe_output_path(raw_path: str) -> Path:
+    """Resolve a user-supplied relative path, constrained to this module's data dir."""
+    if raw_path:
+        raw = Path(raw_path)
+        candidate = raw.resolve() if raw.is_absolute() else (BASE_DIR / raw).resolve()
+    else:
+        latest = _latest_run_dir()
+        candidate = latest.resolve() if latest else RUNS_DIR.resolve()
+    allowed_root = MODULE_DATA_DIR.resolve()
+    if candidate != allowed_root and allowed_root not in candidate.parents:
+        raise ValueError(f"Refusing to open a path outside {allowed_root}: {candidate}")
+    if not candidate.exists():
+        raise FileNotFoundError(f"Output folder does not exist: {candidate}")
+    if candidate.is_file():
+        candidate = candidate.parent
+    return candidate
+
+
+def _open_in_file_manager(path: Path) -> None:
+    system = platform.system().lower()
+    if system == "windows":
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    elif system == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+
+
+def result_actions(form: Dict[str, Any], headers: List[str], rows: List[List[str]]) -> str:
+    """Optional hook used by patched app.py to show a post-run action button."""
+    if not rows:
+        return ""
+    run_dir = str(form.get("_lec_last_run_dir") or "")
+    manifest = str(form.get("_lec_last_manifest") or "")
+    folder_label = html.escape(run_dir or "latest LEC run folder")
+    manifest_html = ""
+    if manifest:
+        manifest_html = f'<span class="subtle" style="margin-left:8px;">Manifest: <code>{html.escape(manifest)}</code></span>'
+    return f'''
+    <div class="notice">
+      <b>LEC output:</b> <code>{folder_label}</code><br>
+      <form method="post" action="/plugin_action" style="display:inline-block; margin-top:8px;">
+        <input type="hidden" name="qkey" value="{META['key']}">
+        <input type="hidden" name="action" value="open_output_folder">
+        <input type="hidden" name="path" value="{html.escape(run_dir, quote=True)}">
+        <button type="submit">Open output folder in Explorer</button>
+      </form>
+      {manifest_html}
+    </div>
+    '''
+
+
+def handle_action(form: Dict[str, Any]) -> str:
+    action = str(form.get("action") or "")
+    if action != "open_output_folder":
+        raise ValueError(f"Unknown LEC action: {action}")
+    path = _resolve_safe_output_path(str(form.get("path") or ""))
+    _open_in_file_manager(path)
+    return f"Opened output folder: {path}"
