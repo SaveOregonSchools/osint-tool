@@ -1,5 +1,5 @@
 """
-LinkedIn Profile Collector v1.2
+LinkedIn Profile Collector v1.3
 
 Drop-in query plugin for Jeff's Flask query console.
 
@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlparse, urlunparse
 
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -41,11 +42,12 @@ except Exception:  # pragma: no cover - lets plugin load even before dependency 
 
 META = {
     "key": "linkedin_profile_collector_v1",
-    "name": "LinkedIn Profile Collector v1.2",
+    "name": "LinkedIn Profile Collector v1.3",
     "description": (
         "Browser-assisted LinkedIn profile collector. Upload or paste a CSV containing "
         "person_name and linkedin_url columns. The module opens a visible browser so you can "
-        "log in and complete any 2FA/challenge manually, then it collects visible profile fields."
+        "log in and complete any 2FA/challenge manually, then it collects visible profile fields. "
+        "v1.3 uses section-specific LinkedIn detail pages for cleaner experience/education output."
     ),
 }
 
@@ -59,8 +61,22 @@ HEADERS = [
     "location",
     "current_title",
     "current_company",
-    "experience_preview",
-    "education_preview",
+    "about_text",
+    "experience_1_title",
+    "experience_1_organization",
+    "experience_1_dates",
+    "experience_1_location",
+    "experience_1_description",
+    "experience_2_title",
+    "experience_2_organization",
+    "experience_2_dates",
+    "experience_2_location",
+    "experience_2_description",
+    "education_1_school",
+    "education_1_degree",
+    "education_1_dates",
+    "volunteer_preview",
+    "certifications_preview",
     "screenshot_path",
     "html_path",
     "error_message",
@@ -336,90 +352,89 @@ def _target_rows(job_id: int, limit: Optional[int] = None) -> List[Tuple]:
         return conn.execute(sql, args).fetchall()
 
 
-def _extract_sections(page) -> Dict[str, str]:
-    """Return best-effort text for LinkedIn profile sections."""
-    sections = page.locator("section").all()
-    out: Dict[str, str] = {}
-    for sec in sections:
-        try:
-            txt = sec.inner_text(timeout=1500).strip()
-        except Exception:
-            continue
-        low = txt.lower()
-        # LinkedIn often includes the section title as the first line.
-        for key in ["about", "experience", "education", "licenses", "certifications", "volunteering", "volunteer"]:
-            if key in low[:200]:
-                canonical = "certifications" if key in ("licenses", "certifications") else "volunteer" if key in ("volunteering", "volunteer") else key
-                if canonical not in out or len(txt) > len(out[canonical]):
-                    out[canonical] = txt
-    return out
-
 
 def _lines(text: str) -> List[str]:
     return [x.strip() for x in re.split(r"[\r\n]+", text or "") if x.strip()]
 
 
-def _section_to_items(section_text: str, max_items: int = 12) -> List[Dict[str, str]]:
-    """
-    LinkedIn markup changes often. This parser intentionally keeps it conservative:
-    it stores raw lines and makes a best-effort title/org/date grouping.
-    """
-    lines = _lines(section_text)
-    if lines and lines[0].lower() in {"experience", "education", "about", "licenses & certifications", "volunteering"}:
-        lines = lines[1:]
-    cleaned: List[str] = []
-    skip_patterns = [
-        r"^show all ", r"^show less", r"^see more", r"^see all", r"^opens profile",
-        r"^skills:", r"^endorsed", r"^\d+ endorsements?$",
-    ]
-    for line in lines:
-        low = line.lower()
-        if any(re.search(p, low) for p in skip_patterns):
+NOISE_LINE_RE = re.compile(
+    r"^(skip to main content|linkedin|home|my network|jobs|messaging|notifications|me|for business|"
+    r"try premium|search|show all|show less|see more|see all|opens profile|open profile|"
+    r"profile photo|background image|message|connect|follow|more|contact info|"
+    r"people also viewed|pages people also viewed|similar profiles|sign in|join now|"
+    r"experience|education|about|licenses & certifications|volunteering|volunteer experience)$",
+    re.I,
+)
+
+
+def _clean_lines(text: str) -> List[str]:
+    out: List[str] = []
+    for line in _lines(text):
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line or NOISE_LINE_RE.search(line):
             continue
-        if line not in cleaned:
-            cleaned.append(line)
-    items: List[Dict[str, str]] = []
-    i = 0
-    while i < len(cleaned) and len(items) < max_items:
-        title = cleaned[i]
-        org = cleaned[i + 1] if i + 1 < len(cleaned) else ""
-        dates = ""
-        location = ""
-        # Look ahead for date-looking and location-looking lines.
-        for j in range(i + 2, min(i + 7, len(cleaned))):
-            if not dates and re.search(r"\b(19|20)\d{2}\b|present|mos?|yrs?|years?", cleaned[j], flags=re.I):
-                dates = cleaned[j]
-            elif not location and re.search(r"area|united states|oregon|washington|california|remote|hybrid|on-site", cleaned[j], flags=re.I):
-                location = cleaned[j]
-        items.append({"title": title, "organization": org, "dates": dates, "location": location})
-        i += 4 if dates else 3
-    return items
+        low = line.lower()
+        if low.startswith("show all ") or low.startswith("see all "):
+            continue
+        if line not in out:
+            out.append(line)
+    return out
 
 
-def _extract_profile(page) -> Dict[str, object]:
-    # Make lazy-loaded sections more likely to appear.
-    for y in [600, 1200, 1800, 2400, 3200, 4200]:
+def _profile_base_url(url: str) -> str:
+    """Return https://www.linkedin.com/in/<slug>/ for common profile URLs."""
+    parsed = urlparse(url.strip())
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc or "www.linkedin.com"
+    parts = [p for p in parsed.path.split("/") if p]
+    if "in" in parts:
+        i = parts.index("in")
+        if len(parts) > i + 1:
+            path = f"/in/{parts[i + 1]}/"
+            return urlunparse((scheme, netloc, path, "", "", ""))
+    # Fallback: strip query/fragment and ensure trailing slash.
+    path = parsed.path if parsed.path.endswith("/") else parsed.path + "/"
+    return urlunparse((scheme, netloc, path, "", "", ""))
+
+
+def _detail_url(profile_url: str, section: str) -> str:
+    return _profile_base_url(profile_url) + f"details/{section}/"
+
+
+def _scroll_page(page, steps: int = 6) -> None:
+    for _ in range(steps):
         try:
-            page.mouse.wheel(0, y)
-            page.wait_for_timeout(500)
+            page.mouse.wheel(0, 900)
+            page.wait_for_timeout(450)
         except Exception:
             pass
     try:
         page.evaluate("window.scrollTo(0, 0)")
     except Exception:
         pass
-    page.wait_for_timeout(750)
+    page.wait_for_timeout(500)
 
-    full_text = ""
+
+def _body_text(page) -> str:
     try:
-        full_text = page.locator("body").inner_text(timeout=5000)
+        return page.locator("body").inner_text(timeout=5000)
     except Exception:
-        pass
+        return ""
 
+
+def _main_text(page) -> str:
+    try:
+        return page.locator("main").inner_text(timeout=5000)
+    except Exception:
+        return _body_text(page)
+
+
+def _extract_top_card(page) -> Dict[str, str]:
+    full_text = _body_text(page)
     profile_name = ""
     headline = ""
     location = ""
-    for selector in ["h1", "main h1"]:
+    for selector in ["main h1", "h1"]:
         try:
             profile_name = page.locator(selector).first.inner_text(timeout=2500).strip()
             if profile_name:
@@ -427,29 +442,185 @@ def _extract_profile(page) -> Dict[str, object]:
         except Exception:
             pass
 
-    # Best effort top card extraction from visible lines.
-    body_lines = _lines(full_text)
+    body_lines = _clean_lines(full_text)
     if profile_name and profile_name in body_lines:
         idx = body_lines.index(profile_name)
-        top_lines = body_lines[idx + 1: idx + 12]
-        # First substantial line after the name is usually headline.
+        top_lines = body_lines[idx + 1: idx + 14]
         for line in top_lines:
-            if line.lower() in {"1st", "2nd", "3rd", "message", "connect", "follow", "more"}:
-                continue
-            if len(line) > 3 and not re.search(r"connections?|followers?", line, flags=re.I):
+            if len(line) > 3 and not re.search(r"connections?|followers?|contact info|message|connect", line, flags=re.I):
                 headline = line
                 break
         for line in top_lines:
-            if re.search(r"area|oregon|washington|california|united states|remote|portland|seattle|new york|washington dc", line, flags=re.I):
+            if re.search(r"area|united states|oregon|washington|california|remote|portland|seattle|new york|washington dc|maine|texas|florida|illinois", line, flags=re.I):
                 location = line
                 break
+    return {"profile_name_visible": profile_name, "headline": headline, "location": location, "full_text": full_text}
 
-    sections = _extract_sections(page)
-    about_summary = "\n".join(_lines(sections.get("about", ""))[1:]).strip() if sections.get("about") else ""
-    experience_items = _section_to_items(sections.get("experience", ""), max_items=20)
-    education_items = _section_to_items(sections.get("education", ""), max_items=12)
-    certification_items = _section_to_items(sections.get("certifications", ""), max_items=12)
-    volunteer_items = _section_to_items(sections.get("volunteer", ""), max_items=12)
+
+def _extract_main_section_text(page, section_title: str) -> str:
+    """Fallback for main profile page sections when detail pages are unavailable."""
+    try:
+        sections = page.locator("section").all()
+    except Exception:
+        sections = []
+    best = ""
+    title_low = section_title.lower()
+    for sec in sections:
+        try:
+            txt = sec.inner_text(timeout=1500).strip()
+        except Exception:
+            continue
+        low = txt.lower()
+        if title_low in low[:250] and len(txt) > len(best):
+            best = txt
+    return best
+
+
+def _extract_about_from_main(page) -> str:
+    txt = _extract_main_section_text(page, "about")
+    lines = _clean_lines(txt)
+    if lines and lines[0].lower() == "about":
+        lines = lines[1:]
+    # Stop if another section accidentally bled in.
+    stop_words = {"activity", "experience", "education", "licenses & certifications", "volunteering"}
+    kept = []
+    for line in lines:
+        if line.lower() in stop_words:
+            break
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def _candidate_card_texts(page) -> List[str]:
+    """Collect likely result cards on LinkedIn details pages."""
+    texts: List[str] = []
+    selectors = [
+        "main li.pvs-list__paged-list-item",
+        "main li.artdeco-list__item",
+        "main section li",
+        "main li",
+    ]
+    for selector in selectors:
+        try:
+            locs = page.locator(selector).all()
+        except Exception:
+            continue
+        for loc in locs:
+            try:
+                txt = loc.inner_text(timeout=1000).strip()
+            except Exception:
+                continue
+            lines = _clean_lines(txt)
+            if len(lines) < 2:
+                continue
+            compact = "\n".join(lines)
+            if compact not in texts and 20 <= len(compact) <= 5000:
+                texts.append(compact)
+        if texts:
+            break
+    return texts
+
+
+def _parse_item_card(card_text: str, kind: str) -> Dict[str, str]:
+    lines = _clean_lines(card_text)
+    item = {"title": "", "organization": "", "dates": "", "location": "", "description": ""}
+    if not lines:
+        return item
+    item["title"] = lines[0]
+    if len(lines) > 1:
+        item["organization"] = lines[1]
+
+    used = {0, 1}
+    for i, line in enumerate(lines[2:], start=2):
+        if not item["dates"] and re.search(r"\b(19|20)\d{2}\b|present|mos?|yrs?|years?|months?", line, re.I):
+            item["dates"] = line
+            used.add(i)
+            continue
+        if not item["location"] and re.search(r"area|united states|oregon|washington|california|remote|hybrid|on-site|portland|seattle|new york|maine|texas|florida|illinois", line, re.I):
+            item["location"] = line
+            used.add(i)
+            continue
+
+    desc_lines = []
+    for i, line in enumerate(lines):
+        if i in used:
+            continue
+        if line == item["title"] or line == item["organization"]:
+            continue
+        # Avoid skill/endorsement noise unless it is the only detail.
+        if re.match(r"^(skills|endorsements?):", line, re.I):
+            continue
+        desc_lines.append(line)
+    item["description"] = "\n".join(desc_lines[:12]).strip()
+
+    if kind == "education":
+        # Keep the same JSON keys internally but map title=school, organization=degree/field.
+        pass
+    return item
+
+
+def _parse_detail_page_items(page, kind: str, max_items: int = 25) -> List[Dict[str, str]]:
+    cards = _candidate_card_texts(page)
+    items: List[Dict[str, str]] = []
+    for card in cards:
+        item = _parse_item_card(card, kind)
+        if not item.get("title"):
+            continue
+        # Filter obvious nav/sidebar cards.
+        joined = " ".join(item.values()).lower()
+        if any(term in joined for term in ["people also viewed", "you might like", "recommended for you"]):
+            continue
+        key = (item.get("title", ""), item.get("organization", ""), item.get("dates", ""))
+        if key not in [(x.get("title"), x.get("organization"), x.get("dates")) for x in items]:
+            items.append(item)
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _visit_detail_and_parse(page, profile_url: str, section: str, kind: str, max_items: int) -> List[Dict[str, str]]:
+    url = _detail_url(profile_url, section)
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(2500)
+        _scroll_page(page, steps=7)
+        return _parse_detail_page_items(page, kind=kind, max_items=max_items)
+    except Exception:
+        return []
+
+
+def _extract_profile(page, linkedin_url: str) -> Dict[str, object]:
+    """Extract a profile using the main page plus LinkedIn detail section pages.
+
+    v1.3 intentionally ignores connection degree and follower/connection counts. Those are
+    noisy for this project and not worth collecting.
+    """
+    # Main profile page for identity/top-card/about/evidence.
+    page.goto(linkedin_url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(3000)
+    _scroll_page(page, steps=6)
+    top = _extract_top_card(page)
+    about_summary = _extract_about_from_main(page)
+    main_full_text = top.get("full_text", "")
+
+    # Detail pages are usually much cleaner than the main profile page.
+    experience_items = _visit_detail_and_parse(page, linkedin_url, "experience", "experience", 30)
+    education_items = _visit_detail_and_parse(page, linkedin_url, "education", "education", 20)
+    certification_items = _visit_detail_and_parse(page, linkedin_url, "certifications", "certifications", 20)
+    volunteer_items = _visit_detail_and_parse(page, linkedin_url, "volunteering-experiences", "volunteer", 20)
+
+    # Fallback to main-page section parsing if detail pages produced nothing.
+    if not experience_items:
+        page.goto(linkedin_url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(1500)
+        _scroll_page(page, steps=6)
+        exp_text = _extract_main_section_text(page, "experience")
+        experience_items = [_parse_item_card("\n".join(_clean_lines(exp_text)[i:i+6]), "experience") for i in range(1, len(_clean_lines(exp_text)), 6)][:10]
+        experience_items = [x for x in experience_items if x.get("title")]
+    if not education_items:
+        edu_text = _extract_main_section_text(page, "education")
+        education_items = [_parse_item_card("\n".join(_clean_lines(edu_text)[i:i+5]), "education") for i in range(1, len(_clean_lines(edu_text)), 5)][:10]
+        education_items = [x for x in education_items if x.get("title")]
 
     current_title = ""
     current_company = ""
@@ -458,9 +629,9 @@ def _extract_profile(page) -> Dict[str, object]:
         current_company = experience_items[0].get("organization", "")
 
     return {
-        "profile_name_visible": profile_name,
-        "headline": headline,
-        "location": location,
+        "profile_name_visible": top.get("profile_name_visible", ""),
+        "headline": top.get("headline", ""),
+        "location": top.get("location", ""),
         "current_title": current_title,
         "current_company": current_company,
         "about_summary": about_summary,
@@ -468,9 +639,8 @@ def _extract_profile(page) -> Dict[str, object]:
         "education": education_items,
         "certifications": certification_items,
         "volunteer": volunteer_items,
-        "full_text": full_text,
+        "full_text": main_full_text,
     }
-
 
 def _has_linkedin_session_cookie(page) -> bool:
     """Return True only when the browser has a normal LinkedIn logged-in session cookie.
@@ -608,7 +778,12 @@ def collect_profiles(job_id: int, form: Dict[str, str]) -> None:
                     html_path = ""
                     screenshot_path = ""
 
-                    profile = _extract_profile(page)
+                    profile = _extract_profile(page, linkedin_url)
+
+                    # Return to the main profile page before saving evidence files.
+                    # The parser may have visited /details/experience/, /details/education/, etc.
+                    page.goto(linkedin_url, wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(2000)
 
                     if save_html:
                         html_file = SNAPSHOT_DIR / f"{stem}.html"
@@ -645,10 +820,56 @@ def collect_profiles(job_id: int, form: Dict[str, str]) -> None:
             context.close()
 
 
-def _preview_rows(job_id: int) -> List[List[str]]:
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            """
+
+def _item_value(items: List[Dict[str, str]], index: int, key: str) -> str:
+    try:
+        return str(items[index].get(key, "") or "")
+    except Exception:
+        return ""
+
+
+def _items_preview(json_text: str, limit: int = 2, education: bool = False) -> str:
+    try:
+        items = json.loads(json_text or "[]")
+    except Exception:
+        return ""
+    parts = []
+    for it in items[:limit]:
+        if education:
+            pieces = [it.get("title", ""), it.get("organization", ""), it.get("dates", "")]
+        else:
+            pieces = [it.get("title", ""), it.get("organization", ""), it.get("dates", "")]
+        parts.append(" - ".join([x for x in pieces if x]))
+    return "; ".join(parts)
+
+
+def _flatten_result_row(row: Tuple) -> List[str]:
+    (
+        target_id, input_name, linkedin_url, status, profile_name, headline, location,
+        current_title, current_company, about_summary, experience_json, education_json,
+        certifications_json, volunteer_json, screenshot_path, html_path, error_message, collected_at
+    ) = row
+    try:
+        exp = json.loads(experience_json or "[]")
+    except Exception:
+        exp = []
+    try:
+        edu = json.loads(education_json or "[]")
+    except Exception:
+        edu = []
+    return [
+        str(target_id or ""), str(input_name or ""), str(linkedin_url or ""), str(status or ""),
+        str(profile_name or ""), str(headline or ""), str(location or ""),
+        str(current_title or ""), str(current_company or ""), str(about_summary or ""),
+        _item_value(exp, 0, "title"), _item_value(exp, 0, "organization"), _item_value(exp, 0, "dates"), _item_value(exp, 0, "location"), _item_value(exp, 0, "description"),
+        _item_value(exp, 1, "title"), _item_value(exp, 1, "organization"), _item_value(exp, 1, "dates"), _item_value(exp, 1, "location"), _item_value(exp, 1, "description"),
+        _item_value(edu, 0, "title"), _item_value(edu, 0, "organization"), _item_value(edu, 0, "dates"),
+        _items_preview(volunteer_json, limit=2), _items_preview(certifications_json, limit=2),
+        str(screenshot_path or ""), str(html_path or ""), str(error_message or ""), str(collected_at or ""),
+    ]
+
+def _result_select_sql() -> str:
+    return """
             SELECT
                 t.id,
                 t.person_name_input,
@@ -659,8 +880,11 @@ def _preview_rows(job_id: int) -> List[List[str]]:
                 COALESCE(r.location, ''),
                 COALESCE(r.current_title, ''),
                 COALESCE(r.current_company, ''),
+                COALESCE(r.about_summary, ''),
                 COALESCE(r.experience_json, ''),
                 COALESCE(r.education_json, ''),
+                COALESCE(r.certifications_json, ''),
+                COALESCE(r.volunteer_json, ''),
                 COALESCE(r.screenshot_path, ''),
                 COALESCE(r.html_snapshot_path, ''),
                 COALESCE(t.error_message, ''),
@@ -669,25 +893,13 @@ def _preview_rows(job_id: int) -> List[List[str]]:
             LEFT JOIN linkedin_profile_results r ON r.target_id = t.id
             WHERE t.job_id=?
             ORDER BY t.id
-            """,
-            (job_id,),
-        ).fetchall()
+            """
 
-    out: List[List[str]] = []
-    for r in rows:
-        r = list(r)
-        # Compact JSON previews for table readability.
-        for idx in [9, 10]:
-            try:
-                items = json.loads(r[idx] or "[]")
-                r[idx] = "; ".join(
-                    " - ".join([x for x in [it.get("title", ""), it.get("organization", ""), it.get("dates", "")] if x])
-                    for it in items[:3]
-                )
-            except Exception:
-                pass
-        out.append([str(x or "") for x in r])
-    return out
+
+def _preview_rows(job_id: int) -> List[List[str]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(_result_select_sql(), (job_id,)).fetchall()
+    return [_flatten_result_row(tuple(r)) for r in rows]
 
 
 def run(form: Dict[str, str]):
@@ -704,7 +916,13 @@ def run(form: Dict[str, str]):
 
 
 def export_headers(form: Dict[str, str]):
-    return HEADERS + ["about_summary", "experience_json", "education_json", "certifications_json", "volunteer_json", "full_text"]
+    return HEADERS + [
+        "experience_json",
+        "education_json",
+        "certifications_json",
+        "volunteer_json",
+        "raw_profile_text",
+    ]
 
 
 def export_rows(form: Dict[str, str]) -> Iterable[List[str]]:
@@ -729,17 +947,15 @@ def export_rows(form: Dict[str, str]) -> Iterable[List[str]]:
                 COALESCE(r.location, ''),
                 COALESCE(r.current_title, ''),
                 COALESCE(r.current_company, ''),
-                COALESCE(r.experience_json, ''),
-                COALESCE(r.education_json, ''),
-                COALESCE(r.screenshot_path, ''),
-                COALESCE(r.html_snapshot_path, ''),
-                COALESCE(t.error_message, ''),
-                COALESCE(r.collected_at, t.collected_at, ''),
                 COALESCE(r.about_summary, ''),
                 COALESCE(r.experience_json, ''),
                 COALESCE(r.education_json, ''),
                 COALESCE(r.certifications_json, ''),
                 COALESCE(r.volunteer_json, ''),
+                COALESCE(r.screenshot_path, ''),
+                COALESCE(r.html_snapshot_path, ''),
+                COALESCE(t.error_message, ''),
+                COALESCE(r.collected_at, t.collected_at, ''),
                 COALESCE(r.full_text, '')
             FROM linkedin_profile_targets t
             LEFT JOIN linkedin_profile_results r ON r.target_id = t.id
@@ -749,4 +965,16 @@ def export_rows(form: Dict[str, str]) -> Iterable[List[str]]:
             (job_id,),
         ).fetchall()
     for row in rows:
-        yield [str(x or "") for x in row]
+        base_row = _flatten_result_row(tuple(row[:18]))
+        experience_json = row[10] or ""
+        education_json = row[11] or ""
+        certifications_json = row[12] or ""
+        volunteer_json = row[13] or ""
+        raw_profile_text = row[18] or ""
+        yield base_row + [
+            str(experience_json),
+            str(education_json),
+            str(certifications_json),
+            str(volunteer_json),
+            str(raw_profile_text),
+        ]
