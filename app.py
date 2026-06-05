@@ -10,11 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
 from flask import Flask, Response, redirect, render_template_string, request, url_for
 
-from dotenv import load_dotenv
 load_dotenv()
-
 
 app = Flask(__name__)
 
@@ -27,10 +26,10 @@ def load_plugins() -> dict[str, Any]:
     """Load/reload query plugins from the local queries/ directory.
 
     A plugin is a Python module with:
-      - META: dict with at least key/name/description
-      - render_fields(form): returns HTML for input fields
-      - run(form): returns (headers, rows)
-      - export_rows(form): yields rows for CSV export
+    - META: dict with at least key/name/description
+    - render_fields(form): returns HTML for input fields
+    - run(form): returns (headers, rows)
+    - export_rows(form): yields rows for CSV export
 
     This mirrors the plugin pattern in the IRS 990 console, but swaps the
     SQLite/local-database back end for remote OSINT/API queries.
@@ -43,12 +42,14 @@ def load_plugins() -> dict[str, Any]:
     for info in pkgutil.iter_modules([str(PLUGIN_DIR)]):
         if info.name.startswith("_"):
             continue
+
         module_name = f"{PLUGIN_PACKAGE}.{info.name}"
         try:
             if module_name in sys.modules:
                 mod = importlib.reload(sys.modules[module_name])
             else:
                 mod = importlib.import_module(module_name)
+
             required = ["META", "render_fields", "run", "export_rows"]
             if all(hasattr(mod, name) for name in required):
                 key = mod.META.get("key")
@@ -57,6 +58,7 @@ def load_plugins() -> dict[str, Any]:
         except Exception as exc:  # pragma: no cover - visible in app UI/logs
             print(f"Failed to load plugin {module_name}: {exc}", file=sys.stderr)
             traceback.print_exc()
+
     return loaded
 
 
@@ -64,6 +66,17 @@ def ensure_registry() -> None:
     global REGISTRY
     if not REGISTRY:
         REGISTRY = load_plugins()
+
+
+def request_payload() -> dict[str, Any]:
+    """Return form fields plus uploaded files for plugins that support CSV upload.
+
+    Existing text-only plugins can continue to use this like a normal dict.
+    File-aware plugins can read form.get("_files") to access request.files.
+    """
+    form: dict[str, Any] = request.form.to_dict(flat=True)
+    form["_files"] = request.files
+    return form
 
 
 def csv_row(values: list[Any] | tuple[Any, ...]) -> str:
@@ -88,7 +101,7 @@ HTML = """
   .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px 16px; }
   .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   label { font-weight: 650; display:block; margin-bottom:3px; }
-  input[type="text"], input[type="number"], input[type="date"], select, textarea {
+  input[type="text"], input[type="number"], input[type="date"], input[type="file"], select, textarea {
     width:100%; box-sizing:border-box; padding:7px; border:1px solid #bbb; border-radius:6px;
     font-family: inherit; font-size: 14px;
   }
@@ -111,14 +124,13 @@ HTML = """
 <body>
 <h1>Social OSINT — Query Console</h1>
 <p class="subtle">
-  Public-source collection helper for nonprofit social-media review. This app does not log into accounts,
-  bypass platform restrictions, or determine legality. Treat flags as leads for review and preserve screenshots/archives separately.
+  Public-source collection helper for nonprofit social-media review. This app does not bypass platform restrictions
+  or determine legality. Treat flags as leads for review and preserve screenshots/archives separately.
 </p>
-
 <div class="notice">
   <span class="pill">MVP target: Bluesky</span>
-  <span class="pill">No credentials required</span>
-  <span class="pill">CSV export</span>
+  <span class="pill">LinkedIn assisted browser module supported</span>
+  <span class="pill">CSV input/export</span>
   <span class="pill">Plugin-based</span>
 </div>
 
@@ -128,7 +140,7 @@ HTML = """
     <select name="qkey" id="qkey" style="width:auto; min-width: 360px;"
             onchange="this.form.requestSubmit(document.getElementById('loadBtn'))">
       {% for key, mod in registry.items() %}
-        <option value="{{ key }}" {% if key == qkey %}selected{% endif %}>{{ mod.META["name"] }}</option>
+      <option value="{{ key }}" {% if key == qkey %}selected{% endif %}>{{ mod.META["name"] }}</option>
       {% endfor %}
     </select>
     <button id="loadBtn" type="submit">Load</button>
@@ -145,16 +157,17 @@ HTML = """
     <h2>{{ registry[qkey].META["name"] }}</h2>
     <p class="subtle">{{ registry[qkey].META.get("description","") }}</p>
 
-    <form method="post" action="/run" onsubmit="return showRunningMessage(event, this);">
+    <form method="post" action="/run" enctype="multipart/form-data" onsubmit="return showRunningMessage(event, this);">
       <input type="hidden" name="qkey" value="{{ qkey }}">
       {{ registry[qkey].render_fields(form or {}) | safe }}
+
       <div class="toolbar" style="margin-top:12px;">
         <label style="margin:0">Preview row limit:</label>
         <input type="number" name="_limit" value="{{ (form or {}).get('_limit','500') }}" min="1" style="width:100px">
         <button type="submit">Run Query</button>
-        <button formaction="/export" formmethod="post">Export CSV (full result)</button>
+        <button formaction="/export" formmethod="post" formenctype="multipart/form-data">Export CSV (full result)</button>
       </div>
-      <div class="running-msg">Running query. Public APIs can be slow or rate-limited; the result will appear below.</div>
+      <div class="running-msg">Running query. Public APIs and browser-assisted modules can be slow; the result will appear below.</div>
     </form>
   </div>
 
@@ -168,9 +181,9 @@ HTML = """
       <table>
         <thead><tr>{% for h in headers %}<th>{{ h }}</th>{% endfor %}</tr></thead>
         <tbody>
-          {% for r in rows %}
-            <tr>{% for v in r %}<td title="{{ v|e }}">{{ v }}</td>{% endfor %}</tr>
-          {% endfor %}
+        {% for r in rows %}
+          <tr>{% for v in r %}<td title="{{ v|e }}">{{ v }}</td>{% endfor %}</tr>
+        {% endfor %}
         </tbody>
       </table>
     </div>
@@ -201,7 +214,16 @@ HTML = """
 def home():
     ensure_registry()
     first_key = next(iter(REGISTRY.keys()), None)
-    return render_template_string(HTML, registry=REGISTRY, qkey=first_key, form=None, headers=None, rows=None, error=None, len=len)
+    return render_template_string(
+        HTML,
+        registry=REGISTRY,
+        qkey=first_key,
+        form=None,
+        headers=None,
+        rows=None,
+        error=None,
+        len=len,
+    )
 
 
 @app.route("/refresh", methods=["POST"])
@@ -217,21 +239,33 @@ def select():
     qkey = request.form.get("qkey")
     if qkey not in REGISTRY:
         qkey = next(iter(REGISTRY.keys()), None)
-    return render_template_string(HTML, registry=REGISTRY, qkey=qkey, form={}, headers=None, rows=None, error=None, len=len)
+    return render_template_string(
+        HTML,
+        registry=REGISTRY,
+        qkey=qkey,
+        form={},
+        headers=None,
+        rows=None,
+        error=None,
+        len=len,
+    )
 
 
 @app.route("/run", methods=["GET", "POST"])
 def run():
     if request.method == "GET":
         return redirect(url_for("home"))
+
     ensure_registry()
     qkey = request.form.get("qkey")
-    form = request.form.to_dict(flat=True)
+    form = request_payload()
+
     if qkey not in REGISTRY:
         return "Unknown query key.", 400
 
     error = None
     headers, rows = None, None
+
     try:
         headers, rows = REGISTRY[qkey].run(form)
         try:
@@ -241,16 +275,28 @@ def run():
         rows = rows[:lim]
     except Exception:
         error = traceback.format_exc()
-    return render_template_string(HTML, registry=REGISTRY, qkey=qkey, form=form, headers=headers, rows=rows, error=error, len=len)
+
+    return render_template_string(
+        HTML,
+        registry=REGISTRY,
+        qkey=qkey,
+        form=form,
+        headers=headers,
+        rows=rows,
+        error=error,
+        len=len,
+    )
 
 
 @app.route("/export", methods=["GET", "POST"])
 def export():
     if request.method == "GET":
         return redirect(url_for("home"))
+
     ensure_registry()
     qkey = request.form.get("qkey")
-    form = request.form.to_dict(flat=True)
+    form = request_payload()
+
     if qkey not in REGISTRY:
         return "Unknown query key.", 400
 
@@ -259,6 +305,7 @@ def export():
             headers = REGISTRY[qkey].export_headers(form)
         else:
             headers = getattr(REGISTRY[qkey], "HEADERS", REGISTRY[qkey].META.get("headers", []))
+
         yield csv_row(headers)
         for row in REGISTRY[qkey].export_rows(form):
             yield csv_row(row)
@@ -266,7 +313,11 @@ def export():
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%MZ")
     base = REGISTRY[qkey].META.get("key", qkey)
     filename = f"{base}_{ts}.csv"
-    return Response(generate(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename={filename}"})
+    return Response(
+        generate(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 @app.route("/health", methods=["GET"])

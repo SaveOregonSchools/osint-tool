@@ -131,7 +131,7 @@ def render_fields(form: dict[str, Any]) -> str:
       <div class="row" style="grid-column: 1 / -1;">
         <label>Search terms</label>
         <textarea name="search_terms" placeholder="school board\nPAC name\norganization name\nballot measure">{search_terms}</textarea>
-        <div class="subtle">One term or phrase per line. Meta limits search_terms to 100 characters; blank is allowed only when page IDs are supplied.</div>
+        <div class="subtle">One term or phrase per line. Meta limits search_terms to 100 characters. Leave blank for page-ID-only searches.</div>
       </div>
 
       <div class="row" style="grid-column: 1 / -1;">
@@ -172,6 +172,7 @@ def render_fields(form: dict[str, Any]) -> str:
           {opt(search_type, "KEYWORD_UNORDERED", "Keyword unordered")}
           {opt(search_type, "KEYWORD_EXACT_PHRASE", "Exact phrase")}
         </select>
+        <div class="subtle">Used only when Search terms is filled. Ignored for page-ID-only searches.</div>
       </div>
 
       <div class="row">
@@ -277,7 +278,7 @@ def _settings(form: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "access_token": _access_token(form),
-        "terms": terms or [""],
+        "terms": terms,
         "page_ids": page_ids,
         "country": country,
         "ad_type": form.get("ad_type") or "POLITICAL_AND_ISSUE_ADS",
@@ -389,8 +390,11 @@ def _base_params(settings: dict[str, Any]) -> dict[str, Any]:
         "ad_type": settings["ad_type"],
         "ad_active_status": settings["ad_active_status"],
         "publisher_platforms": json.dumps(settings["platforms"]),
-        "search_type": settings["search_type"],
     }
+    # Meta's `search_type` parameter applies only to keyword searches.
+    # Sending it with no `search_terms` causes HTTP 400 for page-ID-only queries.
+    if settings.get("terms"):
+        params["search_type"] = settings["search_type"]
     if settings.get("page_ids"):
         params["search_page_ids"] = json.dumps([int(pid) for pid in settings["page_ids"]])
     if settings.get("date_min"):
@@ -492,7 +496,7 @@ def iter_rows(form: dict[str, Any]) -> Iterator[list[Any]]:
     base_params = _base_params(settings)
     seen_ids: set[str] = set()
 
-    for term in settings["terms"]:
+    for term in (settings["terms"] or [""]):
         source_query = _source_query(settings, term)
         returned = 0
         yielded = 0
