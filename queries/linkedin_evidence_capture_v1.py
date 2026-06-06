@@ -1,5 +1,5 @@
 """
-LinkedIn Evidence Capture v1.5
+LinkedIn Evidence Capture v1.6
 
 Drop-in query plugin for the Flask Social OSINT query console.
 
@@ -10,10 +10,7 @@ Purpose:
 - For each supplied profile, capture HTML + screenshots for:
   - main profile page after expanding only the About-section “more” text, then scrolling to bottom
   - optional profile headshot image, when one exists on the main profile page
-  - Experience detail page
-  - Education detail page
-  - Volunteering detail page
-  - Licenses & certifications detail page
+  - selected detail pages, classified from the detail page itself; empty sections are recorded as JSON-only metadata
 - Store all output under data/linkedin_evidence_capture_v1/ so it does not mix
   with the previous LinkedIn collector module.
 
@@ -50,7 +47,7 @@ except Exception:  # pragma: no cover - lets plugin load before dependency insta
 
 META = {
     "key": "linkedin_evidence_capture_v1",
-    "name": "LinkedIn Evidence Capture v1.5 - section-aware detail capture + optional profile photos",
+    "name": "LinkedIn Evidence Capture v1.6 - section-aware detail capture + optional profile photos",
     "description": (
         "Browser-assisted LinkedIn evidence capture. Upload or paste CSV rows with names and "
         "LinkedIn URLs. The module opens a visible browser so you can log in and complete any "
@@ -532,51 +529,43 @@ def scroll_to_bottom(page, max_scrolls: int, pause_seconds: float) -> Dict[str, 
     }
 
 
-def expand_about_more(page, max_rounds: int = 2) -> Dict[str, Any]:
-    """Click only the About-section text expander on the main profile page.
+def expand_about_more(page, max_rounds: int = 1) -> Dict[str, Any]:
+    """Click only the About-card text expander on the main profile page.
 
-    v1.3 clicked expandable text buttons across the whole main page, which could hit
-    Activity/feed post expanders and navigate into a post. This version only looks
-    inside a section whose heading text is exactly "About". Detail pages do not need
-    expander clicks because LinkedIn renders those entries fully expanded.
+    This function deliberately scopes to the closest section/card containing an
+    exact h1/h2/h3 heading of "About". It clicks at most one expandable text
+    button inside that specific card, so Activity/feed post expanders are not
+    touched.
     """
     total_clicked = 0
     errors: List[str] = []
     attempts: List[Any] = []
     original_url = page.url
 
-    js = """
+    js = r"""
     () => {
       function norm(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
-      const sections = Array.from(document.querySelectorAll('section'));
-      const about = sections.find(sec => {
-        const headings = Array.from(sec.querySelectorAll('h1,h2,h3'));
-        return headings.some(h => /^About$/i.test(norm(h.innerText || h.textContent)));
-      });
-      if (!about) return {clicked: 0, attempted: [], reason: 'about-section-not-found'};
+      const headings = Array.from(document.querySelectorAll('section h1, section h2, section h3'));
+      const aboutHeading = headings.find(h => /^About$/i.test(norm(h.innerText || h.textContent)));
+      if (!aboutHeading) return {clicked: 0, attempted: [], reason: 'about-heading-not-found'};
 
-      const candidates = [];
-      for (const el of Array.from(about.querySelectorAll('[data-testid="expandable-text-button"]'))) {
-        candidates.push(el);
-      }
-      const nodes = Array.from(about.querySelectorAll('button,[role="button"],span,a'));
-      for (const el of nodes) {
-        const text = norm(el.innerText || el.textContent);
-        const aria = norm(el.getAttribute('aria-label'));
-        const href = el.getAttribute('href') || '';
-        const combined = `${text} ${aria}`.trim();
-        const isMoreText = /(?:…|\.\.\.)\s*more\b/i.test(combined) || /\bsee more\b/i.test(combined);
-        const isBad = /\b(show all|view all|people also viewed|recommendations|message|follow|connect|for business)\b/i.test(combined);
-        const isGenericMore = /^more$/i.test(text) || /^more$/i.test(aria);
-        const navigatesAway = href && !href.startsWith('#') && !href.startsWith('javascript:');
-        if (!isMoreText || isBad || isGenericMore || navigatesAway) continue;
-        candidates.push(el);
-      }
+      const aboutSection = aboutHeading.closest('section');
+      if (!aboutSection) return {clicked: 0, attempted: [], reason: 'about-section-not-found'};
 
-      const unique = Array.from(new Set(candidates)).slice(0, 5);
-      let clicked = 0;
+      // Prefer the expander attached to the About text box itself.
+      const textBox = aboutSection.querySelector('[data-testid="expandable-text-box"]');
+      let button = null;
+      if (textBox) {
+        button = textBox.querySelector('[data-testid="expandable-text-button"]');
+      }
+      if (!button) {
+        const buttons = Array.from(aboutSection.querySelectorAll('[data-testid="expandable-text-button"]'));
+        button = buttons.find(b => /(?:…|\.\.\.)\s*more\b|\bsee more\b/i.test(norm(b.innerText || b.textContent || b.getAttribute('aria-label'))));
+      }
+      if (!button) return {clicked: 0, attempted: [], reason: 'about-more-not-found'};
+
+      const label = norm(button.innerText || button.textContent || button.getAttribute('aria-label')).slice(0, 80);
       const attempted = [];
-
       function fireClick(el) {
         if (!el) return false;
         try { el.scrollIntoView({block: 'center', inline: 'nearest'}); } catch (e) {}
@@ -590,14 +579,10 @@ def expand_about_more(page, max_rounds: int = 2) -> Dict[str, Any]:
         return false;
       }
 
-      for (const el of unique) {
-        const child = el.querySelector('span[style*="pointer-events: auto"], span, div') || el.firstElementChild;
-        const ok = fireClick(child) || fireClick(el);
-        const label = norm(el.innerText || el.textContent || el.getAttribute('aria-label')).slice(0, 80);
-        attempted.push({label, ok, testid: el.getAttribute('data-testid') || ''});
-        if (ok) clicked += 1;
-      }
-      return {clicked, attempted, reason: ''};
+      const clickableChild = button.querySelector('span[style*="pointer-events: auto"], span, div') || button.firstElementChild;
+      const ok = fireClick(clickableChild) || fireClick(button);
+      attempted.push({label, ok, testid: button.getAttribute('data-testid') || '', scoped_to: 'about'});
+      return {clicked: ok ? 1 : 0, attempted, reason: ''};
     }
     """
 
@@ -608,11 +593,10 @@ def expand_about_more(page, max_rounds: int = 2) -> Dict[str, Any]:
             clicked = int(result.get("clicked") or 0)
             if clicked <= 0:
                 if result.get("reason"):
-                    attempts.append({"label": result.get("reason"), "ok": False, "testid": ""})
+                    attempts.append({"label": result.get("reason"), "ok": False, "testid": "", "scoped_to": "about"})
                 break
             total_clicked += clicked
             time.sleep(1.0)
-            # Safety: About expansion should never navigate. If it does, recover.
             if page.url != original_url:
                 errors.append(f"Unsafe About expander navigation: {page.url}")
                 try:
@@ -631,7 +615,6 @@ def expand_about_more(page, max_rounds: int = 2) -> Dict[str, Any]:
         "more_expander_attempts": attempts[:30],
         "about_more_expanders_clicked": total_clicked,
     }
-
 
 def detect_profile_sections(page) -> Dict[str, Any]:
     """Detect whether detail sections are actually listed on the main profile page.
@@ -703,6 +686,85 @@ def detect_profile_sections(page) -> Dict[str, Any]:
         return page.evaluate(js) or {"sections": {}, "headings": [], "detailLinks": []}
     except Exception as exc:
         return {"sections": {}, "headings": [], "detailLinks": [], "error": str(exc)}
+
+
+def classify_detail_page(page, section: str) -> Dict[str, Any]:
+    """Classify a selected detail page as content, empty, or unknown.
+
+    We no longer rely on the main profile page to decide whether a detail section
+    exists. Instead, we open the direct detail URL and classify the actual page.
+    Empty detail pages are recorded as JSON-only metadata.
+    """
+    labels = {
+        "experience": ["Experience"],
+        "education": ["Education"],
+        "volunteering": ["Volunteering", "Volunteer experience", "Volunteer Experience"],
+        "certifications": ["Licenses & certifications", "Licenses and certifications", "Certifications"],
+    }
+    js = r"""
+    (sectionLabels) => {
+      function norm(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
+      const bodyText = norm(document.body ? document.body.innerText : '');
+      const headings = Array.from(document.querySelectorAll('h1,h2,h3')).map(h => norm(h.innerText || h.textContent)).filter(Boolean);
+      const lowerBody = bodyText.toLowerCase();
+      const hasEmptyMessage = /nothing to see for now/i.test(bodyText) || /no .* to show/i.test(bodyText);
+      const hasSectionHeading = headings.some(h => sectionLabels.some(label => h.toLowerCase() === label.toLowerCase()));
+      const primary = document.querySelector('main#workspace') || document.querySelector('main') || document.body;
+      const primaryText = norm(primary ? primary.innerText : bodyText);
+      const primaryLower = primaryText.toLowerCase();
+      const hasProfileTopcard = /contact info/i.test(primaryText) || /connections/i.test(primaryText);
+
+      // Heuristic: a real detail page usually has a matching section heading and
+      // meaningful primary content, while an empty detail page displays the
+      // standard LinkedIn empty-state text.
+      let status = 'unknown';
+      let reason = '';
+      if (hasEmptyMessage) {
+        status = 'empty_section';
+        reason = 'LinkedIn empty-state message detected';
+      } else if (hasSectionHeading) {
+        status = 'content';
+        reason = 'matching detail section heading detected';
+      } else if (!hasSectionHeading && hasProfileTopcard && primaryText.length < 2500) {
+        status = 'empty_section';
+        reason = 'profile/topcard content only; no matching detail section heading';
+      } else {
+        status = 'unknown';
+        reason = 'no empty-state message and no matching detail heading detected';
+      }
+      return {status, reason, headings, hasEmptyMessage, hasSectionHeading, primaryTextLength: primaryText.length};
+    }
+    """
+    try:
+        return page.evaluate(js, labels.get(section, [section])) or {"status": "unknown", "reason": "no result"}
+    except Exception as exc:
+        return {"status": "unknown", "reason": str(exc), "error": str(exc)}
+
+
+def save_json_only_section_metadata(page, target_dir: Path, section: str, status: str, classification: Dict[str, Any], capture_stats: Optional[Dict[str, Any]] = None) -> Path:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = target_dir / f"{section}.json"
+    page_title = ""
+    try:
+        page_title = page.title()
+    except Exception:
+        pass
+    meta = {
+        "section": section,
+        "status": status,
+        "url": page.url,
+        "title": page_title,
+        "captured_at": _now(),
+        "html_path": "",
+        "screenshot_path": "",
+        "html_size_bytes": 0,
+        "screenshot_size_bytes": 0,
+        "capture_stats": capture_stats or {},
+        "detail_classification": classification,
+        "json_only_reason": "Detail section was empty or could not be confirmed as populated; HTML/PNG not saved.",
+    }
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    return meta_path
 
 
 def update_json_metadata(json_path: Path, updates: Dict[str, Any]) -> None:
@@ -869,6 +931,12 @@ def capture_one_section(page, url: str, target_dir: Path, section: str, max_scro
                 "about_more_expanders_clicked": 0,
                 "detail_page_expansion_skipped": True,
             }
+            classification = classify_detail_page(page, section)
+            capture_stats["detail_classification"] = classification
+            if classification.get("status") == "empty_section":
+                save_json_only_section_metadata(page, target_dir, section, "empty_section", classification, capture_stats=capture_stats)
+                return "empty", "", ""
+
         html_path, screenshot_path, _meta = save_capture(page, target_dir, section, save_screenshot, capture_stats=capture_stats)
         return "ok", _short_path(html_path), _short_path(screenshot_path)
     except Exception as exc:
@@ -960,7 +1028,7 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO evidence_runs (run_id, created_at, source_label, target_count, notes) VALUES (?,?,?,?,?)",
-            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.5 - section-aware detail capture + optional profile photos"),
+            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.6 - section-aware detail capture + optional profile photos"),
         )
 
     with sync_playwright() as p:
@@ -1013,37 +1081,28 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
                     pass
             if main_status != "ok":
                 errors.append("main: capture failed")
-                detected_sections = {"sections": {}, "headings": [], "detailLinks": [], "error": "main capture failed"}
-            else:
-                detected_sections = detect_profile_sections(page)
 
-            listed = detected_sections.get("sections", {}) if isinstance(detected_sections, dict) else {}
-            captured_detail_sections = []
-            skipped_detail_sections = []
-            filtered_detail_sections = []
-            for section_name, section_slug in selected_detail_sections:
-                is_listed = bool((listed.get(section_name) or {}).get("listed"))
-                if is_listed:
-                    filtered_detail_sections.append((section_name, section_slug))
-                    captured_detail_sections.append(section_name)
-                else:
-                    skipped_detail_sections.append(section_name)
+            # v1.6: Do not rely on the main page to decide whether detail sections
+            # exist. LinkedIn often does not load the lower profile cards into the
+            # main-page DOM. Instead, visit each selected detail URL and classify
+            # that detail page as content vs empty_section.
+            captured_detail_sections: List[str] = []
+            empty_detail_sections: List[str] = []
+            attempted_detail_sections: List[str] = [name for name, _slug in selected_detail_sections]
 
-            # Record section-detection decisions in main.json for auditability.
             try:
                 main_json_path = target_dir / "main.json"
                 update_json_metadata(main_json_path, {
-                    "profile_section_detection": detected_sections,
-                    "requested_detail_sections": [name for name, _slug in selected_detail_sections],
-                    "captured_detail_sections": captured_detail_sections,
-                    "skipped_detail_sections_not_listed": skipped_detail_sections,
+                    "requested_detail_sections": attempted_detail_sections,
+                    "detail_section_detection_method": "detail_page_classification",
+                    "detail_section_detection_note": "Main profile cards are not used as the gate because LinkedIn may not load lower profile cards into the main-page DOM.",
                 })
             except Exception:
                 pass
 
             time.sleep(max(1.0, delay_seconds / 2.0))
 
-            for section_name, section_slug in filtered_detail_sections:
+            for section_name, section_slug in selected_detail_sections:
                 url = detail_url(target.linkedin_url, section_slug)
                 status, html_path, screenshot_path = capture_one_section(
                     page=page,
@@ -1056,10 +1115,26 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
                     save_screenshot=save_screenshots,
                 )
                 paths[section_name] = {"html": html_path, "screenshot": screenshot_path}
-                if status != "ok":
+                if status == "ok":
+                    captured_detail_sections.append(section_name)
+                elif status == "empty":
+                    empty_detail_sections.append(section_name)
+                else:
                     errors.append(f"{section_name}: capture failed")
                 # Small pause between section pages.
                 time.sleep(max(1.0, delay_seconds / 2.0))
+
+            try:
+                update_json_metadata(target_dir / "main.json", {
+                    "captured_detail_sections": captured_detail_sections,
+                    "empty_detail_sections": empty_detail_sections,
+                    "skipped_detail_sections_not_selected": [
+                        name for name, _slug in [("experience", "experience"), ("education", "education"), ("volunteering", "volunteering-experiences"), ("certifications", "certifications")]
+                        if name not in attempted_detail_sections
+                    ],
+                })
+            except Exception:
+                pass
 
             status = "ok" if not errors else "partial"
             row = build_row(idx, target, status, paths, "; ".join(errors), collected_at)
