@@ -1,5 +1,5 @@
 """
-LinkedIn Evidence Capture v1.3
+LinkedIn Evidence Capture v1.4
 
 Drop-in query plugin for the Flask Social OSINT query console.
 
@@ -8,7 +8,7 @@ Purpose:
 - Launch a visible Playwright browser using a persistent local browser profile.
 - Let the user manually log in and complete any 2FA/challenges.
 - For each supplied profile, capture HTML + screenshots for:
-  - main profile page after scrolling to bottom and expanding visible “more” text
+  - main profile page after expanding only the About-section “more” text, then scrolling to bottom
   - Experience detail page
   - Education detail page
   - Volunteering detail page
@@ -49,11 +49,11 @@ except Exception:  # pragma: no cover - lets plugin load before dependency insta
 
 META = {
     "key": "linkedin_evidence_capture_v1",
-    "name": "LinkedIn Evidence Capture v1.3",
+    "name": "LinkedIn Evidence Capture v1.4",
     "description": (
         "Browser-assisted LinkedIn evidence capture. Upload or paste CSV rows with names and "
         "LinkedIn URLs. The module opens a visible browser so you can log in and complete any "
-        "2FA/challenge manually. It then scrolls/captures the main profile page and the detail "
+        "2FA/challenge manually. It then captures the main profile page and the detail "
         "pages for Experience, Education, Volunteering, and Licenses & certifications. Output is "
         "stored separately under data/linkedin_evidence_capture_v1/."
     ),
@@ -521,36 +521,39 @@ def scroll_to_bottom(page, max_scrolls: int, pause_seconds: float) -> Dict[str, 
     }
 
 
-def expand_visible_more(page, max_rounds: int = 5) -> Dict[str, Any]:
-    """Click LinkedIn text expanders such as "… more" / "see more".
+def expand_about_more(page, max_rounds: int = 2) -> Dict[str, Any]:
+    """Click only the About-section text expander on the main profile page.
 
-    LinkedIn's current UI often renders text expanders as
-    data-testid="expandable-text-button" with aria-hidden="true" and pointer-events on
-    a child span. The previous text-only approach missed those. This routine targets the
-    stable data-testid first, then falls back to visible text matching while avoiding
-    generic action-menu "More" buttons.
+    v1.3 clicked expandable text buttons across the whole main page, which could hit
+    Activity/feed post expanders and navigate into a post. This version only looks
+    inside a section whose heading text is exactly "About". Detail pages do not need
+    expander clicks because LinkedIn renders those entries fully expanded.
     """
     total_clicked = 0
     errors: List[str] = []
+    attempts: List[Any] = []
+    original_url = page.url
+
     js = """
     () => {
-      const root = document.querySelector('main') || document.querySelector('#workspace') || document.body;
-      const candidates = [];
+      function norm(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
+      const sections = Array.from(document.querySelectorAll('section'));
+      const about = sections.find(sec => {
+        const headings = Array.from(sec.querySelectorAll('h1,h2,h3'));
+        return headings.some(h => /^About$/i.test(norm(h.innerText || h.textContent)));
+      });
+      if (!about) return {clicked: 0, attempted: [], reason: 'about-section-not-found'};
 
-      // Best target for LinkedIn's truncated text widgets.
-      for (const el of Array.from(root.querySelectorAll('[data-testid="expandable-text-button"]'))) {
+      const candidates = [];
+      for (const el of Array.from(about.querySelectorAll('[data-testid="expandable-text-button"]'))) {
         candidates.push(el);
       }
-
-      // Fallback text targets.
-      const nodes = Array.from(root.querySelectorAll('button,[role="button"],span,a'));
+      const nodes = Array.from(about.querySelectorAll('button,[role="button"],span,a'));
       for (const el of nodes) {
-        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-        const aria = (el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+        const text = norm(el.innerText || el.textContent);
+        const aria = norm(el.getAttribute('aria-label'));
         const href = el.getAttribute('href') || '';
         const combined = `${text} ${aria}`.trim();
-        if (!combined) continue;
-
         const isMoreText = /(?:…|\.\.\.)\s*more\b/i.test(combined) || /\bsee more\b/i.test(combined);
         const isBad = /\b(show all|view all|people also viewed|recommendations|message|follow|connect|for business)\b/i.test(combined);
         const isGenericMore = /^more$/i.test(text) || /^more$/i.test(aria);
@@ -559,7 +562,7 @@ def expand_visible_more(page, max_rounds: int = 5) -> Dict[str, Any]:
         candidates.push(el);
       }
 
-      const unique = Array.from(new Set(candidates)).slice(0, 50);
+      const unique = Array.from(new Set(candidates)).slice(0, 5);
       let clicked = 0;
       const attempted = [];
 
@@ -577,42 +580,46 @@ def expand_visible_more(page, max_rounds: int = 5) -> Dict[str, Any]:
       }
 
       for (const el of unique) {
-        const beforeText = (el.closest('[data-testid="expandable-text-box"]') || el.parentElement || el).innerText || '';
         const child = el.querySelector('span[style*="pointer-events: auto"], span, div') || el.firstElementChild;
         const ok = fireClick(child) || fireClick(el);
-        const label = ((el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim()).slice(0, 80);
+        const label = norm(el.innerText || el.textContent || el.getAttribute('aria-label')).slice(0, 80);
         attempted.push({label, ok, testid: el.getAttribute('data-testid') || ''});
         if (ok) clicked += 1;
       }
-      return {clicked, attempted: attempted.slice(0, 20)};
+      return {clicked, attempted, reason: ''};
     }
     """
-    attempts: List[Any] = []
+
     for _round in range(max_rounds):
         try:
             result = page.evaluate(js) or {}
-            clicked = int(result.get("clicked") or 0)
             attempts.extend(result.get("attempted") or [])
+            clicked = int(result.get("clicked") or 0)
             if clicked <= 0:
+                if result.get("reason"):
+                    attempts.append({"label": result.get("reason"), "ok": False, "testid": ""})
                 break
             total_clicked += clicked
-            time.sleep(1.3)
+            time.sleep(1.0)
+            # Safety: About expansion should never navigate. If it does, recover.
+            if page.url != original_url:
+                errors.append(f"Unsafe About expander navigation: {page.url}")
+                try:
+                    page.goto(original_url, wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(1.0)
+                except Exception as nav_exc:
+                    errors.append(f"Failed to return after unsafe navigation: {nav_exc}")
+                break
         except Exception as exc:
             errors.append(str(exc))
             break
-    try:
-        page.evaluate("""
-        () => {
-          const docEl = document.scrollingElement || document.documentElement || document.body;
-          try { docEl.scrollTop = 0; } catch (e) {}
-          try { window.scrollTo(0, 0); } catch (e) {}
-        }
-        """)
-        time.sleep(0.5)
-    except Exception:
-        pass
-    return {"more_expanders_clicked": total_clicked, "more_expander_errors": errors, "more_expander_attempts": attempts[:30]}
 
+    return {
+        "more_expanders_clicked": total_clicked,
+        "more_expander_errors": errors,
+        "more_expander_attempts": attempts[:30],
+        "about_more_expanders_clicked": total_clicked,
+    }
 
 def save_capture(page, target_dir: Path, section: str, save_screenshot: bool, capture_stats: Optional[Dict[str, Any]] = None) -> Tuple[Path, Optional[Path], Dict[str, Any]]:
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -660,21 +667,34 @@ def capture_one_section(page, url: str, target_dir: Path, section: str, max_scro
         page.goto(url, wait_until="domcontentloaded", timeout=90000)
         time.sleep(delay_seconds)
         dismiss_obvious_popups(page)
-        # First scroll all the way down so LinkedIn lazy-loads the page/section content.
-        first_scroll_stats = scroll_to_bottom(page, max_scrolls=max_scrolls, pause_seconds=scroll_pause)
-        # Then expand visible truncated text such as "... more" / "see more" without clicking
-        # generic profile More menus or Show all links.
-        expand_stats_1 = expand_visible_more(page)
-        # Scroll again after expansion because expanded content can cause additional lazy loading.
-        second_scroll_stats = scroll_to_bottom(page, max_scrolls=max_scrolls, pause_seconds=scroll_pause)
-        expand_stats_2 = expand_visible_more(page, max_rounds=2)
-        capture_stats = {
-            "first_scroll": first_scroll_stats,
-            "second_scroll": second_scroll_stats,
-            "more_expanders_clicked": int(expand_stats_1.get("more_expanders_clicked", 0)) + int(expand_stats_2.get("more_expanders_clicked", 0)),
-            "more_expander_errors": (expand_stats_1.get("more_expander_errors", []) or []) + (expand_stats_2.get("more_expander_errors", []) or []),
-            "more_expander_attempts": (expand_stats_1.get("more_expander_attempts", []) or []) + (expand_stats_2.get("more_expander_attempts", []) or []),
-        }
+        if section == "main":
+            # Main profile page: only expand the About-section "more" text. Do not click
+            # Activity/feed post expanders, because those can navigate to post pages.
+            expand_stats = expand_about_more(page)
+            first_scroll_stats = scroll_to_bottom(page, max_scrolls=max_scrolls, pause_seconds=scroll_pause)
+            second_scroll_stats = scroll_to_bottom(page, max_scrolls=2, pause_seconds=scroll_pause)
+            capture_stats = {
+                "first_scroll": first_scroll_stats,
+                "second_scroll": second_scroll_stats,
+                "more_expanders_clicked": int(expand_stats.get("more_expanders_clicked", 0)),
+                "more_expander_errors": expand_stats.get("more_expander_errors", []) or [],
+                "more_expander_attempts": expand_stats.get("more_expander_attempts", []) or [],
+                "about_more_expanders_clicked": int(expand_stats.get("about_more_expanders_clicked", 0)),
+                "detail_page_expansion_skipped": False,
+            }
+        else:
+            # Detail pages render entries fully expanded, so only scroll to trigger lazy loading.
+            first_scroll_stats = scroll_to_bottom(page, max_scrolls=max_scrolls, pause_seconds=scroll_pause)
+            second_scroll_stats = scroll_to_bottom(page, max_scrolls=2, pause_seconds=scroll_pause)
+            capture_stats = {
+                "first_scroll": first_scroll_stats,
+                "second_scroll": second_scroll_stats,
+                "more_expanders_clicked": 0,
+                "more_expander_errors": [],
+                "more_expander_attempts": [],
+                "about_more_expanders_clicked": 0,
+                "detail_page_expansion_skipped": True,
+            }
         html_path, screenshot_path, _meta = save_capture(page, target_dir, section, save_screenshot, capture_stats=capture_stats)
         return "ok", _short_path(html_path), _short_path(screenshot_path)
     except Exception as exc:
@@ -764,7 +784,7 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO evidence_runs (run_id, created_at, source_label, target_count, notes) VALUES (?,?,?,?,?)",
-            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.3"),
+            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.4"),
         )
 
     with sync_playwright() as p:
