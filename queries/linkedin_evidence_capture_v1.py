@@ -1,5 +1,5 @@
 """
-LinkedIn Evidence Capture v1.8
+LinkedIn Evidence Capture v1.9
 
 Drop-in query plugin for the Flask Social OSINT query console.
 
@@ -47,7 +47,7 @@ except Exception:  # pragma: no cover - lets plugin load before dependency insta
 
 META = {
     "key": "linkedin_evidence_capture_v1",
-    "name": "LinkedIn Evidence Capture v1.8 - section-aware detail capture + optional profile photos",
+    "name": "LinkedIn Evidence Capture v1.9 - section-aware detail capture + optional profile photos",
     "description": (
         "Browser-assisted LinkedIn evidence capture. Upload or paste CSV rows with names and "
         "LinkedIn URLs. The module opens a visible browser so you can log in and complete any "
@@ -132,22 +132,35 @@ def _truthy(value: Any) -> bool:
 
 
 def _checkbox(form: Dict[str, Any], name: str, default: bool = True) -> bool:
-    """Return checkbox state even when an unchecked box is omitted from request.form.
+    """Return a boolean option submitted by render_fields().
 
-    HTML checkboxes only submit their name when checked. The render_fields() HTML
-    emits a companion hidden field named <checkbox>__present. If that sentinel is
-    present but the checkbox name is absent, the user intentionally unchecked it.
+    v1.9 avoids relying on normal checkbox submission, because unchecked HTML
+    checkboxes are omitted from request.form and the surrounding app flattens
+    form values. Each visible checkbox is paired with a hidden field using the
+    real option name. JavaScript updates that hidden value to 1 or 0, and run()
+    reads only the hidden value. A fallback reads older checkbox names so older
+    saved forms still work.
     """
+    if name in form:
+        return _truthy(form.get(name, ""))
+    if f"{name}__checkbox" in form:
+        return _truthy(form.get(f"{name}__checkbox", ""))
     if f"{name}__present" in form:
         return _truthy(form.get(name, ""))
     return default
 
 
 def _checkbox_input(form: Dict[str, Any], name: str, label: str, default: bool = True) -> str:
-    checked = "checked" if _checkbox(form, name, default) else ""
+    current = _checkbox(form, name, default)
+    checked = "checked" if current else ""
+    hidden_value = "1" if current else "0"
+    safe_name = html.escape(name, quote=True)
+    safe_id = html.escape(f"{name}_value", quote=True)
+    safe_label = label
     return (
-        f'<input type="hidden" name="{html.escape(name)}__present" value="1">'
-        f'<label><input type="checkbox" name="{html.escape(name)}" value="1" {checked}> {label}</label>'
+        f'<input type="hidden" id="{safe_id}" name="{safe_name}" value="{hidden_value}">'
+        f'<label><input type="checkbox" name="{safe_name}__checkbox" value="1" {checked} '
+        f'onchange="document.getElementById(\'{safe_id}\').value=this.checked?\'1\':\'0\'"> {safe_label}</label>'
     )
 
 
@@ -1057,10 +1070,27 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
     run_dir.mkdir(parents=True, exist_ok=True)
     rows: List[List[str]] = []
 
+    run_settings = {
+        "selected_detail_sections": [name for name, _slug in selected_detail_sections],
+        "save_screenshots": save_screenshots,
+        "save_profile_photos": save_profile_photos,
+        "scroll_main_page": scroll_main_page,
+        "scroll_detail_pages": scroll_detail_pages,
+        "headless": headless,
+        "raw_form_option_values": {
+            key: str(form.get(key, ""))
+            for key in [
+                "capture_experience", "capture_education", "capture_volunteering", "capture_certifications",
+                "save_screenshots", "save_profile_photos", "scroll_main_page", "scroll_detail_pages", "headless"
+            ]
+        },
+    }
+    (run_dir / "run_settings.json").write_text(json.dumps(run_settings, indent=2, ensure_ascii=False), encoding="utf-8")
+
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO evidence_runs (run_id, created_at, source_label, target_count, notes) VALUES (?,?,?,?,?)",
-            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.8 - section-aware detail capture + optional profile photos"),
+            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.9 - section-aware detail capture + optional profile photos"),
         )
 
     with sync_playwright() as p:
