@@ -1,5 +1,5 @@
 """
-LinkedIn Evidence Capture v1.1
+LinkedIn Evidence Capture v1.2
 
 Drop-in query plugin for the Flask Social OSINT query console.
 
@@ -8,7 +8,7 @@ Purpose:
 - Launch a visible Playwright browser using a persistent local browser profile.
 - Let the user manually log in and complete any 2FA/challenges.
 - For each supplied profile, capture HTML + screenshots for:
-  - main profile page after scrolling to bottom
+  - main profile page after scrolling to bottom and expanding visible “more” text
   - Experience detail page
   - Education detail page
   - Volunteering detail page
@@ -49,7 +49,7 @@ except Exception:  # pragma: no cover - lets plugin load before dependency insta
 
 META = {
     "key": "linkedin_evidence_capture_v1",
-    "name": "LinkedIn Evidence Capture v1.1",
+    "name": "LinkedIn Evidence Capture v1.2",
     "description": (
         "Browser-assisted LinkedIn evidence capture. Upload or paste CSV rows with names and "
         "LinkedIn URLs. The module opens a visible browser so you can log in and complete any "
@@ -448,7 +448,76 @@ def scroll_to_bottom(page, max_scrolls: int, pause_seconds: float) -> Dict[str, 
     return {"scrolls": scrolls, "last_height": last_height}
 
 
-def save_capture(page, target_dir: Path, section: str, save_screenshot: bool) -> Tuple[Path, Optional[Path], Dict[str, Any]]:
+def expand_visible_more(page, max_rounds: int = 4) -> Dict[str, Any]:
+    """Click non-navigational LinkedIn "... more" / "see more" expanders in main content.
+
+    This intentionally avoids generic "More" menu buttons and "Show all" links because those
+    can open action menus or navigate away from the evidence page. It targets expanders that
+    expose truncated text already present on the current profile/detail page.
+    """
+    total_clicked = 0
+    errors: List[str] = []
+    js = """
+    () => {
+      const candidates = [];
+      const root = document.querySelector('main') || document.body;
+      const selectors = [
+        'button',
+        '[role="button"]',
+        'span',
+        'a'
+      ];
+      const nodes = Array.from(root.querySelectorAll(selectors.join(',')));
+      for (const el of nodes) {
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        const aria = (el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+        const href = el.getAttribute('href') || '';
+        const combined = `${text} ${aria}`.trim();
+        if (!combined) continue;
+
+        // Keep this narrow: text truncation expanders, not generic menus or section navigation.
+        const isMoreText = /(?:…|\.\.\.)\s*more\b/i.test(combined) || /\bsee more\b/i.test(combined);
+        const isBad = /\b(show all|view all|people also viewed|recommendations|message|follow|connect)\b/i.test(combined);
+        const isGenericMore = /^more$/i.test(text) || /^more$/i.test(aria);
+        const navigatesAway = href && !href.startsWith('#') && !href.startsWith('javascript:');
+        if (!isMoreText || isBad || isGenericMore || navigatesAway) continue;
+
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        if (rect.width <= 0 || rect.height <= 0 || style.visibility === 'hidden' || style.display === 'none') continue;
+        candidates.push(el);
+      }
+      const unique = Array.from(new Set(candidates)).slice(0, 25);
+      let clicked = 0;
+      for (const el of unique) {
+        try {
+          el.scrollIntoView({block: 'center', inline: 'nearest'});
+          el.click();
+          clicked += 1;
+        } catch (e) {}
+      }
+      return clicked;
+    }
+    """
+    for _round in range(max_rounds):
+        try:
+            clicked = int(page.evaluate(js) or 0)
+            if clicked <= 0:
+                break
+            total_clicked += clicked
+            time.sleep(1.2)
+        except Exception as exc:
+            errors.append(str(exc))
+            break
+    try:
+        page.evaluate("() => window.scrollTo(0, 0)")
+        time.sleep(0.5)
+    except Exception:
+        pass
+    return {"more_expanders_clicked": total_clicked, "more_expander_errors": errors}
+
+
+def save_capture(page, target_dir: Path, section: str, save_screenshot: bool, capture_stats: Optional[Dict[str, Any]] = None) -> Tuple[Path, Optional[Path], Dict[str, Any]]:
     target_dir.mkdir(parents=True, exist_ok=True)
     html_path = target_dir / f"{section}.html"
     png_path = target_dir / f"{section}.png"
@@ -474,6 +543,7 @@ def save_capture(page, target_dir: Path, section: str, save_screenshot: bool) ->
         "captured_at": _now(),
         "html_path": _short_path(html_path),
         "screenshot_path": _short_path(screenshot_path) if screenshot_path else "",
+        "capture_stats": capture_stats or {},
     }
     try:
         meta["title"] = page.title(timeout=3000)
@@ -489,8 +559,21 @@ def capture_one_section(page, url: str, target_dir: Path, section: str, max_scro
         page.goto(url, wait_until="domcontentloaded", timeout=90000)
         time.sleep(delay_seconds)
         dismiss_obvious_popups(page)
-        scroll_to_bottom(page, max_scrolls=max_scrolls, pause_seconds=scroll_pause)
-        html_path, screenshot_path, _meta = save_capture(page, target_dir, section, save_screenshot)
+        # First scroll all the way down so LinkedIn lazy-loads the page/section content.
+        first_scroll_stats = scroll_to_bottom(page, max_scrolls=max_scrolls, pause_seconds=scroll_pause)
+        # Then expand visible truncated text such as "... more" / "see more" without clicking
+        # generic profile More menus or Show all links.
+        expand_stats_1 = expand_visible_more(page)
+        # Scroll again after expansion because expanded content can cause additional lazy loading.
+        second_scroll_stats = scroll_to_bottom(page, max_scrolls=max_scrolls, pause_seconds=scroll_pause)
+        expand_stats_2 = expand_visible_more(page, max_rounds=2)
+        capture_stats = {
+            "first_scroll": first_scroll_stats,
+            "second_scroll": second_scroll_stats,
+            "more_expanders_clicked": int(expand_stats_1.get("more_expanders_clicked", 0)) + int(expand_stats_2.get("more_expanders_clicked", 0)),
+            "more_expander_errors": (expand_stats_1.get("more_expander_errors", []) or []) + (expand_stats_2.get("more_expander_errors", []) or []),
+        }
+        html_path, screenshot_path, _meta = save_capture(page, target_dir, section, save_screenshot, capture_stats=capture_stats)
         return "ok", _short_path(html_path), _short_path(screenshot_path)
     except Exception as exc:
         err_path = target_dir / f"{section}_error.txt"
@@ -579,7 +662,7 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO evidence_runs (run_id, created_at, source_label, target_count, notes) VALUES (?,?,?,?,?)",
-            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.1"),
+            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.2"),
         )
 
     with sync_playwright() as p:
