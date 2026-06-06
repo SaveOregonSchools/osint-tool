@@ -1,5 +1,5 @@
 """
-LinkedIn Evidence Capture v1.4
+LinkedIn Evidence Capture v1.5
 
 Drop-in query plugin for the Flask Social OSINT query console.
 
@@ -9,6 +9,7 @@ Purpose:
 - Let the user manually log in and complete any 2FA/challenges.
 - For each supplied profile, capture HTML + screenshots for:
   - main profile page after expanding only the About-section “more” text, then scrolling to bottom
+  - optional profile headshot image, when one exists on the main profile page
   - Experience detail page
   - Education detail page
   - Volunteering detail page
@@ -49,7 +50,7 @@ except Exception:  # pragma: no cover - lets plugin load before dependency insta
 
 META = {
     "key": "linkedin_evidence_capture_v1",
-    "name": "LinkedIn Evidence Capture v1.4",
+    "name": "LinkedIn Evidence Capture v1.5 - section-aware detail capture + optional profile photos",
     "description": (
         "Browser-assisted LinkedIn evidence capture. Upload or paste CSV rows with names and "
         "LinkedIn URLs. The module opens a visible browser so you can log in and complete any "
@@ -66,6 +67,7 @@ HEADERS = [
     "status",
     "main_html",
     "main_screenshot",
+    "profile_photo",
     "experience_html",
     "experience_screenshot",
     "education_html",
@@ -209,6 +211,7 @@ def init_storage() -> None:
                 status TEXT,
                 main_html TEXT,
                 main_screenshot TEXT,
+                profile_photo TEXT,
                 experience_html TEXT,
                 experience_screenshot TEXT,
                 education_html TEXT,
@@ -222,6 +225,13 @@ def init_storage() -> None:
             )
             """
         )
+        # Existing local databases from earlier LEC builds may not have this column.
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(evidence_captures)")}
+            if "profile_photo" not in cols:
+                conn.execute("ALTER TABLE evidence_captures ADD COLUMN profile_photo TEXT")
+        except Exception:
+            pass
 
 
 def read_uploaded_csv(form: Dict[str, Any]) -> str:
@@ -348,11 +358,12 @@ def render_fields(form: Dict[str, Any]) -> str:
         <label><input type="checkbox" name="capture_volunteering" value="1" {'checked' if _truthy(form.get('capture_volunteering', '1')) else ''}> Volunteering</label>
         <label><input type="checkbox" name="capture_certifications" value="1" {'checked' if _truthy(form.get('capture_certifications', '1')) else ''}> Licenses &amp; certifications</label>
       </div>
-      <div class="subtle">Main profile page is always captured. These checkboxes control which detail pages are also captured.</div>
+      <div class="subtle">Main profile page is always captured. Checked detail pages are captured only when that section is actually listed on the profile page.</div>
     </div>
 
     <div class="row">
       <label><input type="checkbox" name="save_screenshots" value="1" {'checked' if _truthy(form.get('save_screenshots', '1')) else ''}> Save screenshots in PNG? (HTML/JSON auto-saved)</label>
+      <label><input type="checkbox" name="save_profile_photos" value="1" {'checked' if _truthy(form.get('save_profile_photos', '1')) else ''}> Save profile headshots</label>
       <label><input type="checkbox" name="headless" value="1" {'checked' if _truthy(form.get('headless', '0')) else ''}> Run headless; not recommended because login/2FA usually requires a visible browser</label>
     </div>
 
@@ -621,6 +632,91 @@ def expand_about_more(page, max_rounds: int = 2) -> Dict[str, Any]:
         "about_more_expanders_clicked": total_clicked,
     }
 
+
+def detect_profile_sections(page) -> Dict[str, Any]:
+    """Detect whether detail sections are actually listed on the main profile page.
+
+    This intentionally does not scan arbitrary body text for words like
+    "volunteering". It looks for section headings and LinkedIn detail links
+    associated with the known profile section URLs.
+    """
+    js = r"""
+    () => {
+      function norm(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
+      function lines(s) {
+        return (s || '')
+          .split(/[\n\r]+/)
+          .map(norm)
+          .filter(Boolean);
+      }
+      const specs = {
+        experience: {slug: '/details/experience/', labels: ['Experience']},
+        education: {slug: '/details/education/', labels: ['Education']},
+        volunteering: {slug: '/details/volunteering-experiences/', labels: ['Volunteering', 'Volunteer experience', 'Volunteer Experience']},
+        certifications: {slug: '/details/certifications/', labels: ['Licenses & certifications', 'Licenses and certifications', 'Certifications']}
+      };
+
+      const result = {};
+      const headings = [];
+      const detailLinks = [];
+
+      for (const sec of Array.from(document.querySelectorAll('section'))) {
+        const headingEls = Array.from(sec.querySelectorAll('h1,h2,h3'));
+        const secHeadings = [];
+        for (const h of headingEls) {
+          const vals = lines(h.innerText || h.textContent);
+          for (const v of vals) {
+            if (!secHeadings.includes(v)) secHeadings.push(v);
+            if (!headings.includes(v)) headings.push(v);
+          }
+        }
+        for (const [key, spec] of Object.entries(specs)) {
+          const headingMatch = secHeadings.some(h => spec.labels.some(label => h.toLowerCase() === label.toLowerCase()));
+          if (headingMatch) {
+            result[key] = result[key] || {listed: false, evidence: []};
+            result[key].listed = true;
+            result[key].evidence.push({type: 'section_heading', value: secHeadings.join(' | ')});
+          }
+        }
+      }
+
+      for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+        let href = a.getAttribute('href') || '';
+        if (!href) continue;
+        for (const [key, spec] of Object.entries(specs)) {
+          if (href.includes(spec.slug)) {
+            result[key] = result[key] || {listed: false, evidence: []};
+            result[key].listed = true;
+            result[key].evidence.push({type: 'detail_link', value: href});
+            detailLinks.push({section: key, href});
+          }
+        }
+      }
+
+      for (const key of Object.keys(specs)) {
+        result[key] = result[key] || {listed: false, evidence: []};
+      }
+      return {sections: result, headings, detailLinks};
+    }
+    """
+    try:
+        return page.evaluate(js) or {"sections": {}, "headings": [], "detailLinks": []}
+    except Exception as exc:
+        return {"sections": {}, "headings": [], "detailLinks": [], "error": str(exc)}
+
+
+def update_json_metadata(json_path: Path, updates: Dict[str, Any]) -> None:
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8")) if json_path.exists() else {}
+        data.update(updates)
+        json_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        try:
+            json_path.with_suffix('.json_update_error.txt').write_text(str(exc), encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def save_capture(page, target_dir: Path, section: str, save_screenshot: bool, capture_stats: Optional[Dict[str, Any]] = None) -> Tuple[Path, Optional[Path], Dict[str, Any]]:
     target_dir.mkdir(parents=True, exist_ok=True)
     html_path = target_dir / f"{section}.html"
@@ -659,6 +755,84 @@ def save_capture(page, target_dir: Path, section: str, save_screenshot: bool, ca
     }
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     return html_path, screenshot_path, meta
+
+
+
+def capture_profile_photo(page, target_dir: Path) -> Dict[str, Any]:
+    """Save the profile headshot from the main profile page, when one exists.
+
+    This captures only the profile-photo image element, not the whole profile page.
+    It intentionally targets the top-card "Profile photo" container so it does not
+    accidentally save the logged-in user's small nav avatar or unrelated images.
+    """
+    target_dir.mkdir(parents=True, exist_ok=True)
+    out_path = target_dir / "profile_photo.png"
+    meta_path = target_dir / "profile_photo.json"
+    result: Dict[str, Any] = {
+        "status": "not_found",
+        "profile_photo_path": "",
+        "profile_photo_src": "",
+        "profile_photo_srcset": "",
+        "error": "",
+        "captured_at": _now(),
+    }
+
+    try:
+        # Prefer the explicit top-card profile-photo container. This avoids the
+        # small "Me" avatar in the LinkedIn navigation bar.
+        locator = page.locator('[aria-label="Profile photo"] img[src]').first
+        try:
+            count = page.locator('[aria-label="Profile photo"] img[src]').count()
+        except Exception:
+            count = 0
+
+        if count <= 0:
+            # Some LinkedIn layouts put the img under a topcard logo-image key.
+            alt_locator = page.locator('a[componentkey="topcard-logo-image-referencekey"] img[src], a[href*="/in/"] [aria-label="Profile photo"] img[src]').first
+            try:
+                alt_count = page.locator('a[componentkey="topcard-logo-image-referencekey"] img[src], a[href*="/in/"] [aria-label="Profile photo"] img[src]').count()
+            except Exception:
+                alt_count = 0
+            if alt_count > 0:
+                locator = alt_locator
+                count = alt_count
+
+        if count <= 0:
+            result["error"] = "No profile-photo img element was found. Profile may use a placeholder/SVG or image may be hidden."
+            meta_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+            return result
+
+        try:
+            locator.scroll_into_view_if_needed(timeout=10000)
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+        src = locator.get_attribute("src", timeout=10000) or ""
+        srcset = locator.get_attribute("srcset", timeout=10000) or ""
+        result["profile_photo_src"] = src
+        result["profile_photo_srcset"] = srcset
+
+        # If LinkedIn shows only a placeholder SVG, there may be no useful img src.
+        if not src and not srcset:
+            result["error"] = "Profile-photo element was found, but no src/srcset was available."
+            meta_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+            return result
+
+        locator.screenshot(path=str(out_path), timeout=30000)
+        result["status"] = "ok"
+        result["profile_photo_path"] = _short_path(out_path)
+        result["profile_photo_size_bytes"] = out_path.stat().st_size if out_path.exists() else 0
+        meta_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        return result
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        try:
+            meta_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+        return result
 
 
 def capture_one_section(page, url: str, target_dir: Path, section: str, max_scrolls: int, scroll_pause: float, delay_seconds: float, save_screenshot: bool) -> Tuple[str, str, str]:
@@ -711,6 +885,7 @@ def build_row(target_id: int, target: Target, status: str, paths: Dict[str, Dict
         status,
         paths.get("main", {}).get("html", ""),
         paths.get("main", {}).get("screenshot", ""),
+        paths.get("main", {}).get("profile_photo", ""),
         paths.get("experience", {}).get("html", ""),
         paths.get("experience", {}).get("screenshot", ""),
         paths.get("education", {}).get("html", ""),
@@ -730,13 +905,13 @@ def save_row_to_db(run_id: str, row: List[str]) -> None:
             """
             INSERT INTO evidence_captures (
                 run_id, target_id, input_name, linkedin_url, status,
-                main_html, main_screenshot,
+                main_html, main_screenshot, profile_photo,
                 experience_html, experience_screenshot,
                 education_html, education_screenshot,
                 volunteering_html, volunteering_screenshot,
                 certifications_html, certifications_screenshot,
                 error_message, collected_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             [run_id] + row,
         )
@@ -774,6 +949,7 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
     if _truthy(form.get("capture_certifications", "1")):
         selected_detail_sections.append(("certifications", "certifications"))
     save_screenshots = _truthy(form.get("save_screenshots", "1"))
+    save_profile_photos = _truthy(form.get("save_profile_photos", "1"))
     headless = _truthy(form.get("headless", "0"))
 
     run_id = _run_id()
@@ -784,7 +960,7 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO evidence_runs (run_id, created_at, source_label, target_count, notes) VALUES (?,?,?,?,?)",
-            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.4"),
+            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.5 - section-aware detail capture + optional profile photos"),
         )
 
     with sync_playwright() as p:
@@ -806,9 +982,68 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
             paths: Dict[str, Dict[str, str]] = {}
             errors: List[str] = []
 
-            sections = [("main", "")] + selected_detail_sections
+            # Always capture the main profile page first. After the main page is loaded,
+            # use its actual section headings/detail links to decide which detail pages
+            # should be visited. This avoids capturing empty detail pages for sections
+            # that are not listed on the profile.
+            main_status, main_html_path, main_screenshot_path = capture_one_section(
+                page=page,
+                url=detail_url(target.linkedin_url, ""),
+                target_dir=target_dir,
+                section="main",
+                max_scrolls=max_scrolls,
+                scroll_pause=scroll_pause,
+                delay_seconds=delay_seconds,
+                save_screenshot=save_screenshots,
+            )
+            paths["main"] = {"html": main_html_path, "screenshot": main_screenshot_path, "profile_photo": ""}
+            profile_photo_info = {"status": "skipped", "reason": "save_profile_photos unchecked"}
+            if main_status == "ok" and save_profile_photos:
+                profile_photo_info = capture_profile_photo(page, target_dir)
+                if profile_photo_info.get("status") == "ok":
+                    paths["main"]["profile_photo"] = profile_photo_info.get("profile_photo_path", "")
+            if main_status == "ok":
+                try:
+                    update_json_metadata(target_dir / "main.json", {
+                        "save_profile_photos": save_profile_photos,
+                        "profile_photo_capture": profile_photo_info,
+                        "profile_photo_path": profile_photo_info.get("profile_photo_path", ""),
+                    })
+                except Exception:
+                    pass
+            if main_status != "ok":
+                errors.append("main: capture failed")
+                detected_sections = {"sections": {}, "headings": [], "detailLinks": [], "error": "main capture failed"}
+            else:
+                detected_sections = detect_profile_sections(page)
 
-            for section_name, section_slug in sections:
+            listed = detected_sections.get("sections", {}) if isinstance(detected_sections, dict) else {}
+            captured_detail_sections = []
+            skipped_detail_sections = []
+            filtered_detail_sections = []
+            for section_name, section_slug in selected_detail_sections:
+                is_listed = bool((listed.get(section_name) or {}).get("listed"))
+                if is_listed:
+                    filtered_detail_sections.append((section_name, section_slug))
+                    captured_detail_sections.append(section_name)
+                else:
+                    skipped_detail_sections.append(section_name)
+
+            # Record section-detection decisions in main.json for auditability.
+            try:
+                main_json_path = target_dir / "main.json"
+                update_json_metadata(main_json_path, {
+                    "profile_section_detection": detected_sections,
+                    "requested_detail_sections": [name for name, _slug in selected_detail_sections],
+                    "captured_detail_sections": captured_detail_sections,
+                    "skipped_detail_sections_not_listed": skipped_detail_sections,
+                })
+            except Exception:
+                pass
+
+            time.sleep(max(1.0, delay_seconds / 2.0))
+
+            for section_name, section_slug in filtered_detail_sections:
                 url = detail_url(target.linkedin_url, section_slug)
                 status, html_path, screenshot_path = capture_one_section(
                     page=page,
