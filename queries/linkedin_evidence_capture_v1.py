@@ -1,5 +1,5 @@
 """
-LinkedIn Evidence Capture v1.7
+LinkedIn Evidence Capture v1.8
 
 Drop-in query plugin for the Flask Social OSINT query console.
 
@@ -47,7 +47,7 @@ except Exception:  # pragma: no cover - lets plugin load before dependency insta
 
 META = {
     "key": "linkedin_evidence_capture_v1",
-    "name": "LinkedIn Evidence Capture v1.7 - section-aware detail capture + optional profile photos",
+    "name": "LinkedIn Evidence Capture v1.8 - section-aware detail capture + optional profile photos",
     "description": (
         "Browser-assisted LinkedIn evidence capture. Upload or paste CSV rows with names and "
         "LinkedIn URLs. The module opens a visible browser so you can log in and complete any "
@@ -129,6 +129,26 @@ def _safe_float(value: Any, default: float) -> float:
 
 def _truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _checkbox(form: Dict[str, Any], name: str, default: bool = True) -> bool:
+    """Return checkbox state even when an unchecked box is omitted from request.form.
+
+    HTML checkboxes only submit their name when checked. The render_fields() HTML
+    emits a companion hidden field named <checkbox>__present. If that sentinel is
+    present but the checkbox name is absent, the user intentionally unchecked it.
+    """
+    if f"{name}__present" in form:
+        return _truthy(form.get(name, ""))
+    return default
+
+
+def _checkbox_input(form: Dict[str, Any], name: str, label: str, default: bool = True) -> str:
+    checked = "checked" if _checkbox(form, name, default) else ""
+    return (
+        f'<input type="hidden" name="{html.escape(name)}__present" value="1">'
+        f'<label><input type="checkbox" name="{html.escape(name)}" value="1" {checked}> {label}</label>'
+    )
 
 
 def _short_path(path: Optional[Path]) -> str:
@@ -350,20 +370,20 @@ def render_fields(form: Dict[str, Any]) -> str:
     <div class="row" style="border:1px solid #ddd; border-radius:8px; padding:10px; background:#fbfbfb;">
       <label style="margin-bottom:8px;"><b>Detailed Captures</b></label>
       <div class="grid">
-        <label><input type="checkbox" name="capture_experience" value="1" {'checked' if _truthy(form.get('capture_experience', '1')) else ''}> Experience</label>
-        <label><input type="checkbox" name="capture_education" value="1" {'checked' if _truthy(form.get('capture_education', '1')) else ''}> Education</label>
-        <label><input type="checkbox" name="capture_volunteering" value="1" {'checked' if _truthy(form.get('capture_volunteering', '1')) else ''}> Volunteering</label>
-        <label><input type="checkbox" name="capture_certifications" value="1" {'checked' if _truthy(form.get('capture_certifications', '1')) else ''}> Licenses &amp; certifications</label>
+        {_checkbox_input(form, 'capture_experience', 'Experience', True)}
+        {_checkbox_input(form, 'capture_education', 'Education', True)}
+        {_checkbox_input(form, 'capture_volunteering', 'Volunteering', True)}
+        {_checkbox_input(form, 'capture_certifications', 'Licenses &amp; certifications', True)}
       </div>
       <div class="subtle">Main profile page is always captured. Checked detail pages are captured only when that section is actually listed on the profile page.</div>
     </div>
 
     <div class="row">
-      <label><input type="checkbox" name="save_screenshots" value="1" {'checked' if _truthy(form.get('save_screenshots', '1')) else ''}> Save screenshots in PNG? (HTML/JSON auto-saved)</label>
-      <label><input type="checkbox" name="save_profile_photos" value="1" {'checked' if _truthy(form.get('save_profile_photos', '1')) else ''}> Save profile headshots</label>
-      <label><input type="checkbox" name="scroll_main_page" value="1" {'checked' if _truthy(form.get('scroll_main_page', '1')) else ''}> Scroll main profile page to bottom before capture</label>
-      <label><input type="checkbox" name="scroll_detail_pages" value="1" {'checked' if _truthy(form.get('scroll_detail_pages', '1')) else ''}> Scroll selected detail pages to bottom before capture</label>
-      <label><input type="checkbox" name="headless" value="1" {'checked' if _truthy(form.get('headless', '0')) else ''}> Run headless; not recommended because login/2FA usually requires a visible browser</label>
+      {_checkbox_input(form, 'save_screenshots', 'Save screenshots in PNG? (HTML/JSON auto-saved)', True)}
+      {_checkbox_input(form, 'save_profile_photos', 'Save profile headshots', True)}
+      {_checkbox_input(form, 'scroll_main_page', 'Scroll main profile page to bottom before capture', True)}
+      {_checkbox_input(form, 'scroll_detail_pages', 'Scroll selected detail pages to bottom before capture', True)}
+      {_checkbox_input(form, 'headless', 'Run headless; not recommended because login/2FA usually requires a visible browser', False)}
     </div>
 
     <div class="notice">
@@ -1018,19 +1038,19 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
     max_scrolls = _safe_int(form.get("max_scrolls", "18"), 18)
     scroll_pause = _safe_float(form.get("scroll_pause_seconds", "2"), 2.0)
     selected_detail_sections = []
-    if _truthy(form.get("capture_experience", "1")):
+    if _checkbox(form, "capture_experience", True):
         selected_detail_sections.append(("experience", "experience"))
-    if _truthy(form.get("capture_education", "1")):
+    if _checkbox(form, "capture_education", True):
         selected_detail_sections.append(("education", "education"))
-    if _truthy(form.get("capture_volunteering", "1")):
+    if _checkbox(form, "capture_volunteering", True):
         selected_detail_sections.append(("volunteering", "volunteering-experiences"))
-    if _truthy(form.get("capture_certifications", "1")):
+    if _checkbox(form, "capture_certifications", True):
         selected_detail_sections.append(("certifications", "certifications"))
-    save_screenshots = _truthy(form.get("save_screenshots", "1"))
-    save_profile_photos = _truthy(form.get("save_profile_photos", "1"))
-    scroll_main_page = _truthy(form.get("scroll_main_page", "1"))
-    scroll_detail_pages = _truthy(form.get("scroll_detail_pages", "1"))
-    headless = _truthy(form.get("headless", "0"))
+    save_screenshots = _checkbox(form, "save_screenshots", True)
+    save_profile_photos = _checkbox(form, "save_profile_photos", True)
+    scroll_main_page = _checkbox(form, "scroll_main_page", True)
+    scroll_detail_pages = _checkbox(form, "scroll_detail_pages", True)
+    headless = _checkbox(form, "headless", False)
 
     run_id = _run_id()
     run_dir = RUNS_DIR / run_id
@@ -1040,7 +1060,7 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO evidence_runs (run_id, created_at, source_label, target_count, notes) VALUES (?,?,?,?,?)",
-            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.7 - section-aware detail capture + optional profile photos"),
+            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.8 - section-aware detail capture + optional profile photos"),
         )
 
     with sync_playwright() as p:
