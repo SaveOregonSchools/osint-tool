@@ -1,5 +1,5 @@
 """
-LinkedIn Evidence Capture v1.2
+LinkedIn Evidence Capture v1.3
 
 Drop-in query plugin for the Flask Social OSINT query console.
 
@@ -49,7 +49,7 @@ except Exception:  # pragma: no cover - lets plugin load before dependency insta
 
 META = {
     "key": "linkedin_evidence_capture_v1",
-    "name": "LinkedIn Evidence Capture v1.2",
+    "name": "LinkedIn Evidence Capture v1.3",
     "description": (
         "Browser-assisted LinkedIn evidence capture. Upload or paste CSV rows with names and "
         "LinkedIn URLs. The module opens a visible browser so you can log in and complete any "
@@ -352,7 +352,7 @@ def render_fields(form: Dict[str, Any]) -> str:
     </div>
 
     <div class="row">
-      <label><input type="checkbox" name="save_screenshots" value="1" {'checked' if _truthy(form.get('save_screenshots', '1')) else ''}> Save screenshots as well as HTML</label>
+      <label><input type="checkbox" name="save_screenshots" value="1" {'checked' if _truthy(form.get('save_screenshots', '1')) else ''}> Save screenshots in PNG? (HTML/JSON auto-saved)</label>
       <label><input type="checkbox" name="headless" value="1" {'checked' if _truthy(form.get('headless', '0')) else ''}> Run headless; not recommended because login/2FA usually requires a visible browser</label>
     </div>
 
@@ -420,54 +420,130 @@ def dismiss_obvious_popups(page) -> None:
 
 
 def scroll_to_bottom(page, max_scrolls: int, pause_seconds: float) -> Dict[str, Any]:
-    """Scroll in passes until height stops increasing. Returns basic scroll stats."""
-    last_height = 0
+    """Scroll the real LinkedIn content area, not just document.body.
+
+    LinkedIn often renders profile content inside internal scrollable containers. A plain
+    window.scrollTo() can report a tiny document height even when the profile content area
+    still needs scrolling. This routine scrolls the document and the largest scrollable
+    elements until heights stabilize.
+    """
+    last_max_height = 0
     stable_count = 0
     scrolls = 0
+    last_stats: Dict[str, Any] = {}
+
+    js = """
+    () => {
+      const docEl = document.scrollingElement || document.documentElement || document.body;
+      const all = Array.from(document.querySelectorAll('*'));
+      const scrollables = [];
+
+      function isScrollable(el) {
+        if (!el) return false;
+        const sh = el.scrollHeight || 0;
+        const ch = el.clientHeight || 0;
+        if (sh <= ch + 25) return false;
+        const style = window.getComputedStyle(el);
+        const oy = style.overflowY || '';
+        return /(auto|scroll|overlay|visible)/i.test(oy) || el === docEl || el.tagName === 'MAIN';
+      }
+
+      for (const el of [docEl, document.body, document.documentElement, document.querySelector('main'), document.querySelector('#workspace'), ...all]) {
+        if (!el || scrollables.includes(el)) continue;
+        if (isScrollable(el)) scrollables.push(el);
+      }
+
+      scrollables.sort((a, b) => (b.scrollHeight || 0) - (a.scrollHeight || 0));
+      const chosen = scrollables.slice(0, 12);
+      for (const el of chosen) {
+        try { el.scrollTop = el.scrollHeight; } catch (e) {}
+      }
+      try { window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)); } catch (e) {}
+
+      const heights = chosen.map((el) => ({
+        tag: el.tagName,
+        id: el.id || '',
+        role: el.getAttribute && (el.getAttribute('role') || ''),
+        testid: el.getAttribute && (el.getAttribute('data-testid') || ''),
+        scrollHeight: el.scrollHeight || 0,
+        clientHeight: el.clientHeight || 0,
+        scrollTop: el.scrollTop || 0
+      }));
+      const maxHeight = Math.max(
+        document.body ? document.body.scrollHeight || 0 : 0,
+        document.documentElement ? document.documentElement.scrollHeight || 0 : 0,
+        ...heights.map(h => h.scrollHeight || 0)
+      );
+      return {max_height: maxHeight, scrollable_count: chosen.length, scrollables: heights.slice(0, 5)};
+    }
+    """
+
     for i in range(max_scrolls):
         scrolls = i + 1
         try:
-            current_height = page.evaluate("() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)")
-            page.evaluate("() => window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight))")
+            stats = page.evaluate(js) or {}
+            last_stats = stats
+            max_height = int(stats.get("max_height") or 0)
             time.sleep(pause_seconds)
-            new_height = page.evaluate("() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)")
-            if int(new_height) <= int(current_height) and int(new_height) <= int(last_height or 0):
+            if max_height <= int(last_max_height or 0):
                 stable_count += 1
             else:
                 stable_count = 0
-            last_height = new_height
+            last_max_height = max_height
             if stable_count >= 2:
                 break
         except Exception:
             time.sleep(pause_seconds)
+
+    # Return to the top after loading, so screenshots and any subsequent routines start cleanly.
     try:
-        page.evaluate("() => window.scrollTo(0, 0)")
+        page.evaluate("""
+        () => {
+          const docEl = document.scrollingElement || document.documentElement || document.body;
+          try { docEl.scrollTop = 0; } catch (e) {}
+          try { window.scrollTo(0, 0); } catch (e) {}
+          for (const el of Array.from(document.querySelectorAll('*'))) {
+            try {
+              if ((el.scrollHeight || 0) > (el.clientHeight || 0) + 25) el.scrollTop = 0;
+            } catch (e) {}
+          }
+        }
+        """)
         time.sleep(0.8)
     except Exception:
         pass
-    return {"scrolls": scrolls, "last_height": last_height}
+
+    return {
+        "scrolls": scrolls,
+        "last_height": last_max_height,
+        "scrollable_count": last_stats.get("scrollable_count", 0),
+        "scrollables": last_stats.get("scrollables", []),
+    }
 
 
-def expand_visible_more(page, max_rounds: int = 4) -> Dict[str, Any]:
-    """Click non-navigational LinkedIn "... more" / "see more" expanders in main content.
+def expand_visible_more(page, max_rounds: int = 5) -> Dict[str, Any]:
+    """Click LinkedIn text expanders such as "… more" / "see more".
 
-    This intentionally avoids generic "More" menu buttons and "Show all" links because those
-    can open action menus or navigate away from the evidence page. It targets expanders that
-    expose truncated text already present on the current profile/detail page.
+    LinkedIn's current UI often renders text expanders as
+    data-testid="expandable-text-button" with aria-hidden="true" and pointer-events on
+    a child span. The previous text-only approach missed those. This routine targets the
+    stable data-testid first, then falls back to visible text matching while avoiding
+    generic action-menu "More" buttons.
     """
     total_clicked = 0
     errors: List[str] = []
     js = """
     () => {
+      const root = document.querySelector('main') || document.querySelector('#workspace') || document.body;
       const candidates = [];
-      const root = document.querySelector('main') || document.body;
-      const selectors = [
-        'button',
-        '[role="button"]',
-        'span',
-        'a'
-      ];
-      const nodes = Array.from(root.querySelectorAll(selectors.join(',')));
+
+      // Best target for LinkedIn's truncated text widgets.
+      for (const el of Array.from(root.querySelectorAll('[data-testid="expandable-text-button"]'))) {
+        candidates.push(el);
+      }
+
+      // Fallback text targets.
+      const nodes = Array.from(root.querySelectorAll('button,[role="button"],span,a'));
       for (const el of nodes) {
         const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
         const aria = (el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
@@ -475,46 +551,67 @@ def expand_visible_more(page, max_rounds: int = 4) -> Dict[str, Any]:
         const combined = `${text} ${aria}`.trim();
         if (!combined) continue;
 
-        // Keep this narrow: text truncation expanders, not generic menus or section navigation.
         const isMoreText = /(?:…|\.\.\.)\s*more\b/i.test(combined) || /\bsee more\b/i.test(combined);
-        const isBad = /\b(show all|view all|people also viewed|recommendations|message|follow|connect)\b/i.test(combined);
+        const isBad = /\b(show all|view all|people also viewed|recommendations|message|follow|connect|for business)\b/i.test(combined);
         const isGenericMore = /^more$/i.test(text) || /^more$/i.test(aria);
         const navigatesAway = href && !href.startsWith('#') && !href.startsWith('javascript:');
         if (!isMoreText || isBad || isGenericMore || navigatesAway) continue;
-
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        if (rect.width <= 0 || rect.height <= 0 || style.visibility === 'hidden' || style.display === 'none') continue;
         candidates.push(el);
       }
-      const unique = Array.from(new Set(candidates)).slice(0, 25);
+
+      const unique = Array.from(new Set(candidates)).slice(0, 50);
       let clicked = 0;
-      for (const el of unique) {
+      const attempted = [];
+
+      function fireClick(el) {
+        if (!el) return false;
+        try { el.scrollIntoView({block: 'center', inline: 'nearest'}); } catch (e) {}
+        try { el.click(); return true; } catch (e) {}
         try {
-          el.scrollIntoView({block: 'center', inline: 'nearest'});
-          el.click();
-          clicked += 1;
+          el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+          el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+          el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+          return true;
         } catch (e) {}
+        return false;
       }
-      return clicked;
+
+      for (const el of unique) {
+        const beforeText = (el.closest('[data-testid="expandable-text-box"]') || el.parentElement || el).innerText || '';
+        const child = el.querySelector('span[style*="pointer-events: auto"], span, div') || el.firstElementChild;
+        const ok = fireClick(child) || fireClick(el);
+        const label = ((el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim()).slice(0, 80);
+        attempted.push({label, ok, testid: el.getAttribute('data-testid') || ''});
+        if (ok) clicked += 1;
+      }
+      return {clicked, attempted: attempted.slice(0, 20)};
     }
     """
+    attempts: List[Any] = []
     for _round in range(max_rounds):
         try:
-            clicked = int(page.evaluate(js) or 0)
+            result = page.evaluate(js) or {}
+            clicked = int(result.get("clicked") or 0)
+            attempts.extend(result.get("attempted") or [])
             if clicked <= 0:
                 break
             total_clicked += clicked
-            time.sleep(1.2)
+            time.sleep(1.3)
         except Exception as exc:
             errors.append(str(exc))
             break
     try:
-        page.evaluate("() => window.scrollTo(0, 0)")
+        page.evaluate("""
+        () => {
+          const docEl = document.scrollingElement || document.documentElement || document.body;
+          try { docEl.scrollTop = 0; } catch (e) {}
+          try { window.scrollTo(0, 0); } catch (e) {}
+        }
+        """)
         time.sleep(0.5)
     except Exception:
         pass
-    return {"more_expanders_clicked": total_clicked, "more_expander_errors": errors}
+    return {"more_expanders_clicked": total_clicked, "more_expander_errors": errors, "more_expander_attempts": attempts[:30]}
 
 
 def save_capture(page, target_dir: Path, section: str, save_screenshot: bool, capture_stats: Optional[Dict[str, Any]] = None) -> Tuple[Path, Optional[Path], Dict[str, Any]]:
@@ -536,19 +633,23 @@ def save_capture(page, target_dir: Path, section: str, save_screenshot: bool, ca
             screenshot_path = None
             (target_dir / f"{section}_screenshot_error.txt").write_text(str(exc), encoding="utf-8", errors="replace")
 
+    page_title = ""
+    try:
+        page_title = page.title()
+    except Exception:
+        pass
+
     meta = {
         "section": section,
         "url": page.url,
-        "title": "",
+        "title": page_title,
         "captured_at": _now(),
         "html_path": _short_path(html_path),
         "screenshot_path": _short_path(screenshot_path) if screenshot_path else "",
+        "html_size_bytes": html_path.stat().st_size if html_path.exists() else 0,
+        "screenshot_size_bytes": screenshot_path.stat().st_size if screenshot_path and screenshot_path.exists() else 0,
         "capture_stats": capture_stats or {},
     }
-    try:
-        meta["title"] = page.title(timeout=3000)
-    except Exception:
-        pass
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     return html_path, screenshot_path, meta
 
@@ -572,6 +673,7 @@ def capture_one_section(page, url: str, target_dir: Path, section: str, max_scro
             "second_scroll": second_scroll_stats,
             "more_expanders_clicked": int(expand_stats_1.get("more_expanders_clicked", 0)) + int(expand_stats_2.get("more_expanders_clicked", 0)),
             "more_expander_errors": (expand_stats_1.get("more_expander_errors", []) or []) + (expand_stats_2.get("more_expander_errors", []) or []),
+            "more_expander_attempts": (expand_stats_1.get("more_expander_attempts", []) or []) + (expand_stats_2.get("more_expander_attempts", []) or []),
         }
         html_path, screenshot_path, _meta = save_capture(page, target_dir, section, save_screenshot, capture_stats=capture_stats)
         return "ok", _short_path(html_path), _short_path(screenshot_path)
@@ -662,7 +764,7 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO evidence_runs (run_id, created_at, source_label, target_count, notes) VALUES (?,?,?,?,?)",
-            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.2"),
+            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.3"),
         )
 
     with sync_playwright() as p:
