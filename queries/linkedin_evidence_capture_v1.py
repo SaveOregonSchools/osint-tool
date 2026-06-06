@@ -1,5 +1,5 @@
 """
-LinkedIn Evidence Capture v1.6
+LinkedIn Evidence Capture v1.7
 
 Drop-in query plugin for the Flask Social OSINT query console.
 
@@ -8,7 +8,7 @@ Purpose:
 - Launch a visible Playwright browser using a persistent local browser profile.
 - Let the user manually log in and complete any 2FA/challenges.
 - For each supplied profile, capture HTML + screenshots for:
-  - main profile page after expanding only the About-section “more” text, then scrolling to bottom
+  - main profile page after expanding only the About-section “more” text, with optional scrolling
   - optional profile headshot image, when one exists on the main profile page
   - selected detail pages, classified from the detail page itself; empty sections are recorded as JSON-only metadata
 - Store all output under data/linkedin_evidence_capture_v1/ so it does not mix
@@ -47,7 +47,7 @@ except Exception:  # pragma: no cover - lets plugin load before dependency insta
 
 META = {
     "key": "linkedin_evidence_capture_v1",
-    "name": "LinkedIn Evidence Capture v1.6 - section-aware detail capture + optional profile photos",
+    "name": "LinkedIn Evidence Capture v1.7 - section-aware detail capture + optional profile photos",
     "description": (
         "Browser-assisted LinkedIn evidence capture. Upload or paste CSV rows with names and "
         "LinkedIn URLs. The module opens a visible browser so you can log in and complete any "
@@ -361,6 +361,8 @@ def render_fields(form: Dict[str, Any]) -> str:
     <div class="row">
       <label><input type="checkbox" name="save_screenshots" value="1" {'checked' if _truthy(form.get('save_screenshots', '1')) else ''}> Save screenshots in PNG? (HTML/JSON auto-saved)</label>
       <label><input type="checkbox" name="save_profile_photos" value="1" {'checked' if _truthy(form.get('save_profile_photos', '1')) else ''}> Save profile headshots</label>
+      <label><input type="checkbox" name="scroll_main_page" value="1" {'checked' if _truthy(form.get('scroll_main_page', '1')) else ''}> Scroll main profile page to bottom before capture</label>
+      <label><input type="checkbox" name="scroll_detail_pages" value="1" {'checked' if _truthy(form.get('scroll_detail_pages', '1')) else ''}> Scroll selected detail pages to bottom before capture</label>
       <label><input type="checkbox" name="headless" value="1" {'checked' if _truthy(form.get('headless', '0')) else ''}> Run headless; not recommended because login/2FA usually requires a visible browser</label>
     </div>
 
@@ -897,7 +899,7 @@ def capture_profile_photo(page, target_dir: Path) -> Dict[str, Any]:
         return result
 
 
-def capture_one_section(page, url: str, target_dir: Path, section: str, max_scrolls: int, scroll_pause: float, delay_seconds: float, save_screenshot: bool) -> Tuple[str, str, str]:
+def capture_one_section(page, url: str, target_dir: Path, section: str, max_scrolls: int, scroll_pause: float, delay_seconds: float, save_screenshot: bool, do_scroll: bool = True) -> Tuple[str, str, str]:
     """Return status, html_path, screenshot_path for a single page/section."""
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=90000)
@@ -907,8 +909,12 @@ def capture_one_section(page, url: str, target_dir: Path, section: str, max_scro
             # Main profile page: only expand the About-section "more" text. Do not click
             # Activity/feed post expanders, because those can navigate to post pages.
             expand_stats = expand_about_more(page)
-            first_scroll_stats = scroll_to_bottom(page, max_scrolls=max_scrolls, pause_seconds=scroll_pause)
-            second_scroll_stats = scroll_to_bottom(page, max_scrolls=2, pause_seconds=scroll_pause)
+            if do_scroll:
+                first_scroll_stats = scroll_to_bottom(page, max_scrolls=max_scrolls, pause_seconds=scroll_pause)
+                second_scroll_stats = scroll_to_bottom(page, max_scrolls=2, pause_seconds=scroll_pause)
+            else:
+                first_scroll_stats = {"skipped": True, "reason": "scroll_main_page unchecked"}
+                second_scroll_stats = {"skipped": True, "reason": "scroll_main_page unchecked"}
             capture_stats = {
                 "first_scroll": first_scroll_stats,
                 "second_scroll": second_scroll_stats,
@@ -919,9 +925,13 @@ def capture_one_section(page, url: str, target_dir: Path, section: str, max_scro
                 "detail_page_expansion_skipped": False,
             }
         else:
-            # Detail pages render entries fully expanded, so only scroll to trigger lazy loading.
-            first_scroll_stats = scroll_to_bottom(page, max_scrolls=max_scrolls, pause_seconds=scroll_pause)
-            second_scroll_stats = scroll_to_bottom(page, max_scrolls=2, pause_seconds=scroll_pause)
+            # Detail pages render entries fully expanded; optional scrolling can trigger lazy loading.
+            if do_scroll:
+                first_scroll_stats = scroll_to_bottom(page, max_scrolls=max_scrolls, pause_seconds=scroll_pause)
+                second_scroll_stats = scroll_to_bottom(page, max_scrolls=2, pause_seconds=scroll_pause)
+            else:
+                first_scroll_stats = {"skipped": True, "reason": "scroll_detail_pages unchecked"}
+                second_scroll_stats = {"skipped": True, "reason": "scroll_detail_pages unchecked"}
             capture_stats = {
                 "first_scroll": first_scroll_stats,
                 "second_scroll": second_scroll_stats,
@@ -1018,6 +1028,8 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
         selected_detail_sections.append(("certifications", "certifications"))
     save_screenshots = _truthy(form.get("save_screenshots", "1"))
     save_profile_photos = _truthy(form.get("save_profile_photos", "1"))
+    scroll_main_page = _truthy(form.get("scroll_main_page", "1"))
+    scroll_detail_pages = _truthy(form.get("scroll_detail_pages", "1"))
     headless = _truthy(form.get("headless", "0"))
 
     run_id = _run_id()
@@ -1028,7 +1040,7 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO evidence_runs (run_id, created_at, source_label, target_count, notes) VALUES (?,?,?,?,?)",
-            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.6 - section-aware detail capture + optional profile photos"),
+            (run_id, _now(), "CSV/text input", len(targets), "LinkedIn Evidence Capture v1.7 - section-aware detail capture + optional profile photos"),
         )
 
     with sync_playwright() as p:
@@ -1063,6 +1075,7 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
                 scroll_pause=scroll_pause,
                 delay_seconds=delay_seconds,
                 save_screenshot=save_screenshots,
+                do_scroll=scroll_main_page,
             )
             paths["main"] = {"html": main_html_path, "screenshot": main_screenshot_path, "profile_photo": ""}
             profile_photo_info = {"status": "skipped", "reason": "save_profile_photos unchecked"}
@@ -1074,6 +1087,8 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
                 try:
                     update_json_metadata(target_dir / "main.json", {
                         "save_profile_photos": save_profile_photos,
+                        "scroll_main_page": scroll_main_page,
+                        "scroll_detail_pages": scroll_detail_pages,
                         "profile_photo_capture": profile_photo_info,
                         "profile_photo_path": profile_photo_info.get("profile_photo_path", ""),
                     })
@@ -1113,6 +1128,7 @@ def run(form: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
                     scroll_pause=scroll_pause,
                     delay_seconds=delay_seconds,
                     save_screenshot=save_screenshots,
+                    do_scroll=scroll_detail_pages,
                 )
                 paths[section_name] = {"html": html_path, "screenshot": screenshot_path}
                 if status == "ok":
