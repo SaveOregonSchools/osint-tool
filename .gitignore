@@ -17,6 +17,11 @@ venv/
 # Logs
 *.log
 
+# Test output
+.pytest_cache/
+.coverage
+htmlcov/
+
 # OS files
 Thumbs.db
 .DS_Store

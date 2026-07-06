@@ -105,7 +105,8 @@ The app uses public AppView reads. If an endpoint returns a 401/403/429/other er
 Run the smoke tests before committing changes:
 
 ```bash
-python -m unittest discover -s tests
+pip install -r requirements-dev.txt
+pytest
 ```
 
 The GitHub Actions workflow in `.github/workflows/ci.yml` runs the same smoke

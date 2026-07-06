@@ -12,7 +12,7 @@ Use Python 3.11 or newer when possible.
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
 python app.py
 ```
 
@@ -23,7 +23,7 @@ The app runs at `http://127.0.0.1:5000` by default.
 Before committing application changes, run:
 
 ```powershell
-python -m unittest discover -s tests
+pytest
 ```
 
 For dependency or packaging changes, also run:
