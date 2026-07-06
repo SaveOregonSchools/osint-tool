@@ -1,34 +1,51 @@
-# Social OSINT Query Console — Bluesky MVP
+# Social OSINT Query Console
 
-A small Flask app for public-source social-media review of nonprofits and leaders. It follows the same plugin-console pattern as the IRS 990 query app: each module in `queries/` exposes `META`, `render_fields()`, `run()`, and `export_rows()`.
+A small Flask app for public-source social-media and ad-library review. The app
+is a plugin console: each module in `queries/` defines its own input form,
+collection logic, preview rows, and CSV export.
 
-The first target platform is **Bluesky** because its public AT Protocol reads are straightforward and do not require credentials for the endpoints used here.
+The current integrations cover:
 
-## What this MVP does
+- Bluesky public profile, feed, and keyword-search review.
+- Meta Ad Library public ad search for Facebook, Instagram, and Threads
+  placements.
+- Browser-assisted LinkedIn profile/evidence capture for pages visible to a
+  logged-in browser session you control.
 
-- Validates Bluesky handles/DIDs with public profile lookups.
-- Scans one or more public Bluesky author feeds for posts/reposts/replies.
-- Runs targeted keyword searches, optionally limited to specific accounts.
-- Flags posts for review using local keyword/regex patterns for:
-  - candidate-intervention review terms, such as `vote for`, `endorse`, `defeat`, `campaign`, `donate to candidate`;
-  - lobbying review terms, such as `contact lawmakers`, `support/oppose bill`, `HB 1234`, `ballot measure`, `vote yes/no on`;
-  - custom terms, names, handles, slogans, bills, or ballot measures you enter.
-- Exports CSV evidence logs with post URLs, text, timestamps, matched terms, basic engagement counts, embed summaries, and source API endpoint.
+## Core App Capabilities
 
-## What it does not do
+- Loads query modules dynamically from `queries/`.
+- Provides a browser UI for selecting a module, entering query settings, running
+  a preview, and exporting the full result to CSV.
+- Supports text inputs and CSV uploads for file-aware plugins.
+- Applies shared candidate-intervention and lobbying-review keyword/pattern
+  flags where plugins use the common classifier.
+- Keeps local data, evidence captures, browser sessions, exports, and caches out
+  of Git.
+- Exposes `/health` for a simple app/plugin smoke check.
 
-- It does not log into social accounts.
-- It does not bypass platform access controls, rate limits, or privacy settings.
+## Integration Guides
+
+- [Bluesky integration](README-Bluesky.md)
+- [Instagram / Meta Ad Library integration](README-Instagram.md)
+- [LinkedIn integration](README-LinkedIn.md)
+
+## What This App Does Not Do
+
+- It does not bypass platform access controls, rate limits, login challenges,
+  CAPTCHA, 2FA, or privacy settings.
 - It does not collect deleted, private, or restricted content.
-- It does not determine whether conduct is illegal. Flags are leads for legal/compliance review.
-- It does not replace screenshots or web archives. For serious evidence preservation, save screenshots with URL/date/context and archive pages where possible.
+- It does not determine whether conduct is illegal. Flags are leads for
+  human/legal/compliance review.
+- It does not replace screenshots, archives, or other evidence-preservation
+  steps for high-value findings.
 
 ## Install
 
 ```bash
-cd social_osint_console
+cd osint-tool
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+source .venv/bin/activate  # Windows PowerShell: .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python app.py
 ```
@@ -39,14 +56,14 @@ Then open:
 http://127.0.0.1:5000
 ```
 
-## Suggested workflow
+For development and tests, install the dev requirements instead:
 
-1. Use **Bluesky — profile lookup / account validation** to confirm handles and DIDs.
-2. Use **Bluesky — scan account feeds for lobbying/candidate flags** to scan recent posts/reposts/replies for selected accounts.
-3. Use **Bluesky — API keyword search by account** for specific candidate names, bill numbers, hashtags, slogans, or ballot measures.
-4. Export CSV, then manually preserve screenshots/archives for high-value rows.
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
 
-## Optional environment variables
+## Optional Environment Variables
 
 ```bash
 # Default is https://public.api.bsky.app
@@ -60,9 +77,17 @@ export OSINT_REQUEST_DELAY="0.2"
 
 # Optional custom user agent
 export OSINT_USER_AGENT="your-org-social-osint-console/0.1"
+
+# Required for Meta Ad Library unless pasted into the module form
+export META_AD_LIBRARY_ACCESS_TOKEN="your_meta_ad_library_token"
+
+# Default is v25.0
+export META_GRAPH_API_VERSION="v25.0"
 ```
 
-## Adding another platform/API plugin
+On Windows PowerShell, use `$env:NAME="value"` or put these values in `.env`.
+
+## Plugin Contract
 
 Create a new Python file in `queries/` with this shape:
 
@@ -90,12 +115,24 @@ def export_rows(form):
     yield ["value1", "value2"]
 ```
 
-The main app will load it automatically after you click **Refresh Queries**.
+The main app will load the module automatically after startup or after clicking
+**Refresh Queries**.
 
-## Notes on Bluesky endpoints used
+Plugins can optionally define:
 
-- `app.bsky.actor.getProfile`
-- `app.bsky.feed.getAuthorFeed`
-- `app.bsky.feed.searchPosts`
+- `result_actions(form, headers, rows)` to render follow-up controls after a
+  preview run.
+- `handle_action(form)` to process those follow-up controls through
+  `/plugin_action`.
 
-The app uses public AppView reads. If an endpoint returns a 401/403/429/other error, the plugin either surfaces it in the UI or adds a status row when that option is enabled.
+## Development
+
+Run checks before committing:
+
+```bash
+pytest
+python -m compileall app.py common.py queries tests
+```
+
+The GitHub Actions workflow in `.github/workflows/ci.yml` runs pytest and a
+Python compile check on pushes and pull requests.
