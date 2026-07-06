@@ -58,6 +58,11 @@ META = {
         "Collect visible Facebook Page posts and optional top-level comments through the official Meta Graph API. "
         "Requires an access token with the permissions Meta requires for the target Page/content."
     ),
+    "source_type": "official_api",
+    "limitations": [
+        "Graph API Page endpoints are not a general-purpose public Facebook/Instagram scraping API.",
+        "Access depends on Meta app review, token type, permissions, and target Page/content visibility.",
+    ],
     "headers": HEADERS,
 }
 

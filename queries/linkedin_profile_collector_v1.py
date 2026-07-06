@@ -49,6 +49,11 @@ META = {
         "log in and complete any 2FA/challenge manually, then it collects visible profile fields. "
         "v1.3 uses section-specific LinkedIn detail pages for cleaner experience/education output."
     ),
+    "source_type": "manual_entry",
+    "limitations": [
+        "Browser-assisted workflow for pages visible to a user-controlled logged-in session.",
+        "Does not bypass CAPTCHA, 2FA, login challenges, privacy settings, or access controls.",
+    ],
 }
 
 HEADERS = [
