@@ -1,4 +1,4 @@
-# Social OSINT Query Console — Bluesky MVP
+# Social OSINT Query Console - Bluesky MVP
 
 A small Flask app for public-source social-media review of nonprofits and leaders. It follows the same plugin-console pattern as the IRS 990 query app: each module in `queries/` exposes `META`, `render_fields()`, `run()`, and `export_rows()`.
 
@@ -26,9 +26,9 @@ The first target platform is **Bluesky** because its public AT Protocol reads ar
 ## Install
 
 ```bash
-cd social_osint_console
+cd osint-tool
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+source .venv/bin/activate  # Windows PowerShell: .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python app.py
 ```
@@ -41,9 +41,9 @@ http://127.0.0.1:5000
 
 ## Suggested workflow
 
-1. Use **Bluesky — profile lookup / account validation** to confirm handles and DIDs.
-2. Use **Bluesky — scan account feeds for lobbying/candidate flags** to scan recent posts/reposts/replies for selected accounts.
-3. Use **Bluesky — API keyword search by account** for specific candidate names, bill numbers, hashtags, slogans, or ballot measures.
+1. Use **Bluesky - profile lookup / account validation** to confirm handles and DIDs.
+2. Use **Bluesky - scan account feeds for lobbying/candidate flags** to scan recent posts/reposts/replies for selected accounts.
+3. Use **Bluesky - API keyword search by account** for specific candidate names, bill numbers, hashtags, slogans, or ballot measures.
 4. Export CSV, then manually preserve screenshots/archives for high-value rows.
 
 ## Optional environment variables
@@ -99,3 +99,14 @@ The main app will load it automatically after you click **Refresh Queries**.
 - `app.bsky.feed.searchPosts`
 
 The app uses public AppView reads. If an endpoint returns a 401/403/429/other error, the plugin either surfaces it in the UI or adds a status row when that option is enabled.
+
+## Development
+
+Run the smoke tests before committing changes:
+
+```bash
+python -m unittest discover -s tests
+```
+
+The GitHub Actions workflow in `.github/workflows/ci.yml` runs the same smoke
+tests and a Python compile check on pushes and pull requests.
