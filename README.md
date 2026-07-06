@@ -7,6 +7,9 @@ collection logic, preview rows, and CSV export.
 The current integrations cover:
 
 - Bluesky public profile, feed, and keyword-search review.
+- X recent public post search through the official X API.
+- Facebook Page post and top-level comment collection through the Meta Graph
+  API, where your token has the required permissions.
 - Meta Ad Library public ad search for Facebook, Instagram, and Threads
   placements.
 - Browser-assisted LinkedIn profile/evidence capture for pages visible to a
@@ -27,8 +30,39 @@ The current integrations cover:
 ## Integration Guides
 
 - [Bluesky integration](README-Bluesky.md)
+- [Facebook Page content integration](README-Facebook.md)
 - [Instagram / Meta Ad Library integration](README-Instagram.md)
 - [LinkedIn integration](README-LinkedIn.md)
+- [X integration](README-X.md)
+
+## Current Expansion Notes
+
+The most practical next modules fall into three buckets:
+
+- Official API collectors: X recent/all search, Facebook Page posts/comments,
+  Meta Ad Library, Bluesky search/feeds, Reddit, YouTube Data API, Google
+  Custom Search, and Common Crawl/GDELT-style web/news discovery.
+- Browser-assisted collectors: LinkedIn-style workflows for content visible to
+  a browser session you control, useful when a platform has no general public
+  search API but normal manual review is allowed.
+- Enrichment and evidence helpers: URL expansion, screenshot/archive workflows,
+  duplicate clustering, account identity matching, saved-search watchlists, and
+  export bundles for review packets.
+
+Important platform caveats:
+
+- Facebook organic posts/comments are not like the Ad Library. The new Page
+  content module uses Graph API Page/post/comment endpoints, and access depends
+  on Meta app review, token type, Page visibility, and permissions.
+- Instagram arbitrary public organic post/comment search is limited through
+  official APIs. Instagram Graph API workflows are strongest for owned or
+  authorized Business/Creator accounts, media IDs, mentions, and comment
+  management, not broad scraping of public Instagram.
+- X search requires X developer access and a bearer token. Query operators and
+  historical depth depend on the access tier.
+- Browser-assisted modules should keep the same boundary as the LinkedIn
+  modules: user-controlled login, visible pages only, no CAPTCHA/2FA bypass, and
+  no stored credentials.
 
 ## What This App Does Not Do
 
@@ -81,8 +115,18 @@ export OSINT_USER_AGENT="your-org-social-osint-console/0.1"
 # Required for Meta Ad Library unless pasted into the module form
 export META_AD_LIBRARY_ACCESS_TOKEN="your_meta_ad_library_token"
 
+# Required for Facebook Page content unless pasted into the module form.
+# Falls back to META_AD_LIBRARY_ACCESS_TOKEN if this is not set.
+export META_GRAPH_ACCESS_TOKEN="your_meta_graph_token"
+
 # Default is v25.0
 export META_GRAPH_API_VERSION="v25.0"
+
+# Required for X recent search unless pasted into the module form
+export X_BEARER_TOKEN="your_x_api_bearer_token"
+
+# Default is https://api.x.com/2
+export X_API_BASE="https://api.x.com/2"
 ```
 
 On Windows PowerShell, use `$env:NAME="value"` or put these values in `.env`.
