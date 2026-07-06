@@ -55,6 +55,11 @@ META = {
         "pages for Experience, Education, Volunteering, and Licenses & certifications. Output is "
         "stored separately under data/linkedin_evidence_capture_v1/."
     ),
+    "source_type": "manual_entry",
+    "limitations": [
+        "Browser-assisted workflow for pages visible to a user-controlled logged-in session.",
+        "Does not bypass CAPTCHA, 2FA, login challenges, privacy settings, or access controls.",
+    ],
 }
 
 HEADERS = [

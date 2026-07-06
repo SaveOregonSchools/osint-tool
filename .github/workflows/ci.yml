@@ -24,4 +24,4 @@ jobs:
         run: pytest
 
       - name: Compile Python files
-        run: python -m compileall app.py common.py queries tests
+        run: python -m compileall app.py common.py osint_common.py providers queries tests

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import importlib
 import io
+import json
 import pkgutil
 import sys
 import traceback
@@ -12,6 +13,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from flask import Flask, Response, redirect, render_template_string, request, url_for
+from osint_common import enforce_source_access
 
 load_dotenv()
 
@@ -187,6 +189,40 @@ BASE_CSS = """
     background: #fff;
     font-size: 13px;
   }
+  .nav-links { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+  .button-link {
+    border: 1px solid var(--border);
+    background: #fff;
+    color: var(--primary-dark);
+    border-radius: 6px;
+    padding: 8px 12px;
+    min-height: 36px;
+    font: inherit;
+    font-weight: 650;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+  }
+  .button-link:hover { background: var(--panel); }
+  .source-badge {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid #ccd4de;
+    border-radius: 999px;
+    padding: 2px 8px;
+    background: var(--panel);
+    color: #334155;
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .limitations {
+    margin: 10px 0 0;
+    padding: 10px 12px;
+    border: 1px solid #e6d37a;
+    border-radius: 8px;
+    background: var(--warn);
+  }
+  .limitations ul { margin: 6px 0 0 18px; padding: 0; }
   .module-sections { display: grid; gap: 26px; max-width: 980px; margin-top: 18px; }
   .module-list { display: grid; gap: 10px; }
   .module-row {
@@ -285,9 +321,12 @@ LAYOUT_START = """
     <a class="home-link" href="{{ url_for('home') }}" aria-label="Home">{{ home_icon | safe }}</a>
     <h1>Social OSINT - Query Console</h1>
   </div>
-  <a class="brand-link" href="https://www.saveoregonschools.com" aria-label="Save Oregon Schools website">
-    <img class="brand-logo" src="{{ url_for('static', filename='save-oregon-schools-logo.png') }}" alt="Save Oregon Schools">
-  </a>
+  <div class="nav-links">
+    <a class="button-link" href="{{ url_for('resources') }}">Resources</a>
+    <a class="brand-link" href="https://www.saveoregonschools.com" aria-label="Save Oregon Schools website">
+      <img class="brand-logo" src="{{ url_for('static', filename='save-oregon-schools-logo.png') }}" alt="Save Oregon Schools">
+    </a>
+  </div>
 </header>
 <main>
 """
@@ -391,7 +430,10 @@ HOME_HTML = LAYOUT_START + """
         {% for item in section.entries %}
           <div class="module-row">
             <a class="module-button" href="{{ item.href }}">{{ item.label }}</a>
-            <div class="description">{{ item.description }}</div>
+            <div class="description">
+              <span class="source-badge">{{ item.source_type }}</span>
+              {{ item.description }}
+            </div>
           </div>
         {% endfor %}
       </div>
@@ -416,10 +458,34 @@ QUERY_HTML = LAYOUT_START + """
 {% if qkey and qkey in registry %}
   <div class="panel">
     <h2>{{ registry[qkey].META["name"] }}</h2>
+    <div class="toolbar">
+      <span class="source-badge">{{ registry[qkey].META.get("source_type", "official_api") }}</span>
+      {% if registry[qkey].META.get("coverage") %}
+        <span class="subtle">{{ registry[qkey].META.get("coverage") }}</span>
+      {% endif %}
+    </div>
     <p class="subtle">{{ registry[qkey].META.get("description","") }}</p>
+    {% if registry[qkey].META.get("limitations") %}
+      <div class="limitations">
+        <b>Limitations</b>
+        <ul>
+          {% for limitation in registry[qkey].META.get("limitations", []) %}
+            <li>{{ limitation }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+    {% endif %}
 
     <form method="post" action="{{ url_for('run') }}" enctype="multipart/form-data" onsubmit="return showRunningMessage(event, this);">
       <input type="hidden" name="qkey" value="{{ qkey }}">
+      <div class="row">
+        <label>Data access mode</label>
+        <select name="data_access_mode">
+          {% for value, label in data_access_modes %}
+            <option value="{{ value }}" {% if (form or {}).get("data_access_mode", "official") == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
       {{ registry[qkey].render_fields(form or {}) | safe }}
 
       <div class="toolbar" style="margin-top:12px;">
@@ -430,7 +496,11 @@ QUERY_HTML = LAYOUT_START + """
         <button type="submit">{{ run_button_label }}</button>
         {% if not hide_csv_export %}
           <button formaction="{{ url_for('export') }}" formmethod="post" formenctype="multipart/form-data">Export CSV (full result)</button>
+          <button formaction="{{ url_for('export_jsonl') }}" formmethod="post" formenctype="multipart/form-data">Export JSONL</button>
+          <button formaction="{{ url_for('raw_json_export') }}" formmethod="post" formenctype="multipart/form-data">Save Raw JSON</button>
+          <button formaction="{{ url_for('archive_urls') }}" formmethod="post" formenctype="multipart/form-data">Archive URLs</button>
         {% endif %}
+        <a class="button-link" href="{{ url_for('evidence_checklist') }}">Open Evidence Checklist</a>
       </div>
       <div class="running-msg">Running query. Public APIs and browser-assisted modules can be slow; the result will appear below.</div>
     </form>
@@ -467,7 +537,13 @@ QUERY_HTML = LAYOUT_START + """
     document.body.classList.add("is-running");
     const submitter = event.submitter;
     const submitAction = submitter ? submitter.getAttribute("formaction") : "";
-    const isExport = submitAction === "{{ url_for('export') }}";
+    const exportActions = new Set([
+      "{{ url_for('export') }}",
+      "{{ url_for('export_jsonl') }}",
+      "{{ url_for('raw_json_export') }}",
+      "{{ url_for('archive_urls') }}"
+    ]);
+    const isExport = exportActions.has(submitAction);
     const buttons = form.querySelectorAll("button");
     buttons.forEach(function(btn) { btn.disabled = true; });
     if (isExport) {
@@ -492,6 +568,13 @@ def _template_context(**extra: Any) -> dict[str, Any]:
     return ctx
 
 
+DATA_ACCESS_MODE_OPTIONS = [
+    ("official", "Official APIs only"),
+    ("approved", "Official + approved research APIs"),
+    ("unofficial", "Include unofficial local tools"),
+]
+
+
 def _build_home_sections() -> list[dict[str, Any]]:
     seen_query_keys: set[str] = set()
     sections: list[dict[str, Any]] = []
@@ -507,6 +590,7 @@ def _build_home_sections() -> list[dict[str, Any]]:
                     "label": label,
                     "href": url_for("query_page", qkey=key),
                     "description": description or mod.META.get("description", ""),
+                    "source_type": mod.META.get("source_type", "official_api"),
                 }
             )
         if items:
@@ -521,6 +605,7 @@ def _build_home_sections() -> list[dict[str, Any]]:
                 "label": mod.META["name"],
                 "href": url_for("query_page", qkey=key),
                 "description": mod.META.get("description", ""),
+                "source_type": mod.META.get("source_type", "official_api"),
             }
         )
     if extra_items:
@@ -574,7 +659,8 @@ def _render_query(
             custom_results_html=custom_results_html,
             hide_preview_limit=_module_flag(qkey, "HIDE_PREVIEW_LIMIT"),
             hide_csv_export=_module_flag(qkey, "HIDE_CSV_EXPORT"),
-            run_button_label=getattr(REGISTRY[qkey], "RUN_BUTTON_LABEL", "Run Query") if qkey in REGISTRY else "Run Query",
+            run_button_label=getattr(REGISTRY[qkey], "RUN_BUTTON_LABEL", "Run Preview") if qkey in REGISTRY else "Run Preview",
+            data_access_modes=DATA_ACCESS_MODE_OPTIONS,
             len=len,
         ),
     )
@@ -583,6 +669,50 @@ def _render_query(
 @app.route("/", methods=["GET"])
 def home():
     return _render_home()
+
+
+RESOURCES_HTML = LAYOUT_START + """
+<div class="home-title-row">
+  <h2>Resources</h2>
+  <p class="note">Investigator notes and external public-source tools</p>
+</div>
+
+<section class="panel" id="evidence-checklist">
+  <h3>Evidence Checklist</h3>
+  <p class="subtle">Use the console as triage. For high-value matches, preserve source context before drawing conclusions.</p>
+  <ol>
+    <li>Save raw API JSON and the normalized CSV/JSONL row.</li>
+    <li>Open and save the canonical URL.</li>
+    <li>Capture a screenshot with URL bar and timestamp visible where allowed.</li>
+    <li>Attempt Wayback or other public archive capture for public web pages.</li>
+    <li>Preserve context: profile metadata, surrounding thread/comments, dates, and media.</li>
+    <li>Use review labels such as candidate_intervention_review, lobbying_review, and needs_manual_review. Flags are not legal conclusions.</li>
+  </ol>
+</section>
+
+<section class="panel">
+  <h3>Tool Registry</h3>
+  <p class="subtle">These links are starting points for manual investigation and corroboration. The app does not scrape tool registries.</p>
+  <p>
+    <a href="https://bellingcat.gitbook.io/toolkit" target="_blank" rel="noreferrer">Bellingcat Online Investigation Toolkit</a><br>
+    <a href="https://adstransparency.google.com/" target="_blank" rel="noreferrer">Google Ads Transparency Center</a><br>
+    <a href="https://transparency.meta.com/researchtools/ad-library/" target="_blank" rel="noreferrer">Meta Ad Library</a><br>
+    <a href="https://archive.org/web/" target="_blank" rel="noreferrer">Wayback Machine</a><br>
+    <a href="https://commoncrawl.org/" target="_blank" rel="noreferrer">Common Crawl</a><br>
+    <a href="https://www.gdeltproject.org/" target="_blank" rel="noreferrer">GDELT</a>
+  </p>
+</section>
+""" + LAYOUT_END
+
+
+@app.route("/resources", methods=["GET"])
+def resources():
+    return render_template_string(RESOURCES_HTML, **_template_context(title="Social OSINT - Resources"))
+
+
+@app.route("/evidence-checklist", methods=["GET"])
+def evidence_checklist():
+    return redirect(url_for("resources") + "#evidence-checklist")
 
 
 @app.route("/query/<qkey>", methods=["GET"])
@@ -627,6 +757,7 @@ def run():
     result_actions_html = ""
 
     try:
+        enforce_source_access(REGISTRY[qkey].META, form)
         headers, rows = REGISTRY[qkey].run(form)
         if not _module_flag(qkey, "DISABLE_ROW_LIMIT"):
             try:
@@ -677,6 +808,7 @@ def export():
 
     if qkey not in REGISTRY:
         return "Unknown query key.", 400
+    enforce_source_access(REGISTRY[qkey].META, form)
 
     def generate():
         if hasattr(REGISTRY[qkey], "export_headers"):
@@ -691,6 +823,118 @@ def export():
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%MZ")
     base = REGISTRY[qkey].META.get("key", qkey)
     filename = f"{base}_{ts}.csv"
+    return Response(
+        generate(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+def _headers_for_export(qkey: str, form: dict[str, Any]) -> list[str]:
+    if hasattr(REGISTRY[qkey], "export_headers"):
+        return REGISTRY[qkey].export_headers(form)
+    return getattr(REGISTRY[qkey], "HEADERS", REGISTRY[qkey].META.get("headers", []))
+
+
+@app.route("/export_jsonl", methods=["GET", "POST"])
+def export_jsonl():
+    if request.method == "GET":
+        return redirect(url_for("home"))
+
+    ensure_registry()
+    qkey = request.form.get("qkey")
+    form = request_payload()
+
+    if qkey not in REGISTRY:
+        return "Unknown query key.", 400
+    enforce_source_access(REGISTRY[qkey].META, form)
+
+    def generate():
+        headers = _headers_for_export(qkey, form)
+        for row in REGISTRY[qkey].export_rows(form):
+            yield json.dumps(dict(zip(headers, row)), ensure_ascii=False) + "\n"
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%MZ")
+    base = REGISTRY[qkey].META.get("key", qkey)
+    filename = f"{base}_{ts}.jsonl"
+    return Response(
+        generate(),
+        mimetype="application/x-ndjson",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.route("/raw_json_export", methods=["GET", "POST"])
+def raw_json_export():
+    if request.method == "GET":
+        return redirect(url_for("home"))
+
+    ensure_registry()
+    qkey = request.form.get("qkey")
+    form = request_payload()
+
+    if qkey not in REGISTRY:
+        return "Unknown query key.", 400
+    enforce_source_access(REGISTRY[qkey].META, form)
+
+    def generate():
+        headers = _headers_for_export(qkey, form)
+        raw_idx = headers.index("raw_json") if "raw_json" in headers else -1
+        for row in REGISTRY[qkey].export_rows(form):
+            if raw_idx >= 0 and raw_idx < len(row) and row[raw_idx]:
+                raw = str(row[raw_idx])
+                yield raw if raw.endswith("\n") else raw + "\n"
+            else:
+                yield json.dumps(dict(zip(headers, row)), ensure_ascii=False) + "\n"
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%MZ")
+    base = REGISTRY[qkey].META.get("key", qkey)
+    filename = f"{base}_raw_{ts}.jsonl"
+    return Response(
+        generate(),
+        mimetype="application/x-ndjson",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.route("/archive_urls", methods=["GET", "POST"])
+def archive_urls():
+    if request.method == "GET":
+        return redirect(url_for("home"))
+
+    ensure_registry()
+    qkey = request.form.get("qkey")
+    form = request_payload()
+
+    if qkey not in REGISTRY:
+        return "Unknown query key.", 400
+    enforce_source_access(REGISTRY[qkey].META, form)
+
+    url_columns = {
+        "canonical_url",
+        "tweet_url",
+        "post_url",
+        "permalink_url",
+        "ad_library_public_url",
+        "ad_detail_url",
+        "video_url",
+        "comment_url",
+        "url",
+        "link",
+    }
+
+    def generate():
+        headers = _headers_for_export(qkey, form)
+        yield csv_row(["plugin_key", "url_column", "url", "notes"])
+        for row in REGISTRY[qkey].export_rows(form):
+            row_map = dict(zip(headers, row))
+            for column, value in row_map.items():
+                if column in url_columns and value:
+                    yield csv_row([qkey, column, value, "Manual archive/screenshot review recommended."])
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%MZ")
+    base = REGISTRY[qkey].META.get("key", qkey)
+    filename = f"{base}_archive_urls_{ts}.csv"
     return Response(
         generate(),
         mimetype="text/csv",

@@ -29,7 +29,7 @@ pytest
 For dependency or packaging changes, also run:
 
 ```powershell
-python -m compileall app.py common.py queries tests
+python -m compileall app.py common.py osint_common.py providers queries tests
 ```
 
 ## Development Notes

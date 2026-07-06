@@ -30,6 +30,8 @@ Thumbs.db
 downloads/
 exports/
 cache/
+captures/
+private_sessions/
 
 # Local app data, scraped output, browser sessions, screenshots, databases
 data/

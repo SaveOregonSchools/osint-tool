@@ -3,26 +3,22 @@ from __future__ import annotations
 from typing import Any, Iterator
 
 from common import get_form_bool, h
-from osint_common import core_row
 from providers.x_api import XApiClient
 from queries._shared import export_core, keep_row, run_core
-from queries._x_common import TWEET_HEADERS, base_tweet_params, build_recent_query, max_results_field, tweet_row, x_flag_controls, x_settings, x_token_field
+from queries._x_common import TWEET_HEADERS, base_tweet_params, build_recent_query, max_results_field, tweet_row, x_flag_controls, x_settings, x_time_fields, x_token_field
 
 
 HEADERS = TWEET_HEADERS
 
 META = {
-    "key": "x_recent_search",
-    "name": "X - Recent Search",
-    "description": (
-        "Search recent public X posts through the official X API v2 recent search endpoint, "
-        "with account, mention, hashtag, URL, and conversation filters."
-    ),
+    "key": "x_full_archive_search",
+    "name": "X - Full Archive Search",
+    "description": "Search the X full archive endpoint when your X access tier supports /2/tweets/search/all.",
     "source_type": "official_api",
     "limitations": [
-        "Recent search is limited to the recent window available to your X API access tier.",
-        "Replies/comments are reconstructed with search operators such as conversation_id, to:, and mentions.",
-        "X controls API availability, rate/cost limits, and returned fields.",
+        "Full archive access requires the appropriate X paid/self-serve or enterprise access.",
+        "Replies are reconstructed with search operators such as conversation_id, to:, and mentions; there is no separate comments API.",
+        "Use dry run to inspect query strings before spending read credits.",
     ],
     "headers": HEADERS,
 }
@@ -32,26 +28,17 @@ def render_fields(form: dict[str, Any]) -> str:
     exclude_retweets = "checked" if get_form_bool(form, "exclude_retweets", True) else ""
     exclude_replies = "checked" if get_form_bool(form, "exclude_replies", False) else ""
     dry_run = "checked" if get_form_bool(form, "dry_run", False) else ""
-    query_terms = form.get("query_terms", form.get("terms", form.get("raw_queries", "")))
-    from_handles = form.get("from_handles", form.get("authors", ""))
     return f"""
     <div class="grid">
       {x_token_field()}
       <div class="row" style="grid-column: 1 / -1;">
         <label>Query terms</label>
-        <textarea name="query_terms" placeholder='"vote for"&#10;endorse&#10;ballot measure'>{h(query_terms)}</textarea>
+        <textarea name="query_terms" placeholder='"vote for"&#10;endorse&#10;ballot measure'>{h(form.get("query_terms", ""))}</textarea>
       </div>
-      <div class="row" style="grid-column: 1 / -1;">
-        <label>From handles</label>
-        <textarea name="from_handles" placeholder="org_handle&#10;leader_handle">{h(from_handles)}</textarea>
-      </div>
-      <div class="row"><label>To handles</label><textarea name="to_handles">{h(form.get("to_handles", ""))}</textarea></div>
+      <div class="row"><label>From handles</label><textarea name="from_handles">{h(form.get("from_handles", ""))}</textarea></div>
       <div class="row"><label>Mentions</label><textarea name="mentions">{h(form.get("mentions", ""))}</textarea></div>
-      <div class="row"><label>Hashtags</label><textarea name="hashtags">{h(form.get("hashtags", ""))}</textarea></div>
-      <div class="row"><label>URL terms</label><textarea name="url_terms" placeholder="example.org">{h(form.get("url_terms", ""))}</textarea></div>
       <div class="row"><label>Conversation ID</label><input type="text" name="conversation_id" value="{h(form.get("conversation_id", ""))}"></div>
-      <div class="row"><label>Date min</label><input type="date" name="date_min" value="{h(form.get("date_min", ""))}"></div>
-      <div class="row"><label>Date max</label><input type="date" name="date_max" value="{h(form.get("date_max", ""))}"></div>
+      {x_time_fields(form)}
       {max_results_field(form, 100)}
       <div class="row">
         <label><input type="checkbox" name="exclude_retweets" {exclude_retweets}> Exclude retweets</label>
@@ -67,22 +54,15 @@ def render_fields(form: dict[str, Any]) -> str:
     """
 
 
-def _time_form(form: dict[str, Any]) -> dict[str, Any]:
-    out = dict(form)
-    if out.get("date_min") and not out.get("start_time"):
-        out["start_time"] = f"{out['date_min']}T00:00:00Z"
-    if out.get("date_max") and not out.get("end_time"):
-        out["end_time"] = f"{out['date_max']}T23:59:59Z"
-    return out
-
-
 def iter_row_dicts(form: dict[str, Any]) -> Iterator[dict[str, Any]]:
     settings = x_settings(form)
     query = build_recent_query(form)
     if get_form_bool(form, "dry_run", False):
+        from osint_common import core_row
+
         yield core_row(
             source_platform="X",
-            source_api="dry-run /2/tweets/search/recent",
+            source_api="dry-run /2/tweets/search/all",
             source_type=META["source_type"],
             target_input=query,
             query_text=query,
@@ -91,9 +71,9 @@ def iter_row_dicts(form: dict[str, Any]) -> Iterator[dict[str, Any]]:
         )
         return
     client = XApiClient(settings["bearer_token"])
-    params = base_tweet_params(_time_form(form))
-    for tweet in client.iter_search(query, endpoint="tweets/search/recent", max_results=settings["max_results"], params=params):
-        row = tweet_row(tweet, source_api="GET /2/tweets/search/recent", source_type=META["source_type"], target_input=query, query_text=query, settings=settings)
+    params = base_tweet_params(form)
+    for tweet in client.iter_search(query, endpoint="tweets/search/all", max_results=settings["max_results"], params=params):
+        row = tweet_row(tweet, source_api="GET /2/tweets/search/all", source_type=META["source_type"], target_input=query, query_text=query, settings=settings)
         if keep_row(row, settings):
             yield row
 

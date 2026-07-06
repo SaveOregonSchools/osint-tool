@@ -85,6 +85,11 @@ META = {
         "Facebook and/or Instagram. Best for issue/election/political ad review and page-based "
         "ad monitoring. Requires a free Meta developer app token with Ad Library API access."
     ),
+    "source_type": "official_api",
+    "limitations": [
+        "Meta Ad Library API is for ads and does not retrieve ordinary posts, comments, stories, or reels comments.",
+        "Coverage, fields, and date ranges depend on Meta API rules and ad category.",
+    ],
     "headers": HEADERS,
 }
 
