@@ -1,124 +1,133 @@
-# LinkedIn Profile Collector v1
+# LinkedIn Integration
 
-This is a first-version, browser-assisted LinkedIn profile collection module for the Flask query console pattern used in your IRS 990 / OSINT tools.
+The LinkedIn modules are browser-assisted evidence tools. They open a visible
+Playwright browser using a persistent local browser profile, let you log in and
+complete any 2FA/challenge manually, and then collect only pages visible to that
+browser session.
 
-It is intentionally designed to avoid storing your LinkedIn password or bypassing LinkedIn security checks. A normal browser window opens, you log in directly on LinkedIn, and you complete any 2FA/challenge manually. The collector then visits the profile URLs from your CSV and saves visible profile information, screenshots, and HTML snapshots.
+They do not store your LinkedIn password, bypass CAPTCHA/2FA/login challenges
+or rate limits, or access private/restricted content.
 
-## What it collects
+## Modules
 
-Best-effort fields:
+### LinkedIn Evidence Capture v1.9
 
-- Input name
-- LinkedIn URL
-- Visible profile name
-- Headline
-- Location
-- Current title/company, inferred from Experience
-- Experience section as JSON
-- Education section as JSON
-- Licenses/certifications section as JSON
-- Volunteer section as JSON
-- Full visible page text
-- Screenshot path
-- HTML snapshot path
-- Status/error message
-- Collection timestamp
+Plugin key: `linkedin_evidence_capture_v1`
 
-LinkedIn changes its page markup often, so the structured extraction is intentionally conservative. The saved screenshot, HTML, and full visible text are the evidentiary fallback.
-
-## Files included
+This is the preferred LinkedIn evidence-preservation module. It accepts uploaded
+or pasted CSV rows with names and LinkedIn profile URLs, then captures evidence
+under:
 
 ```text
-queries/linkedin_profile_collector_v1.py   Drop-in query plugin
-app_upload_patch.py                        Small patch needed for CSV upload support
-requirements_linkedin.txt                  Additional dependency
-sample_linkedin_targets.csv                Example input CSV
+data/linkedin_evidence_capture_v1/
 ```
 
-## Install
+For each target, it can capture:
 
-From the root of your existing Flask query-console project:
+- Main profile HTML and screenshot.
+- Optional profile photo when one is visible on the main profile page.
+- Detail pages for Experience, Education, Volunteering, and Licenses &
+  certifications.
+- JSON metadata for sections, including empty or unavailable sections.
+- A run manifest and SQLite tracking database.
 
-```powershell
-pip install -r requirements_linkedin.txt
-python -m playwright install chromium
-```
+Outputs are separated from the older profile collector so evidence runs do not
+mix with earlier experiments.
 
-Then copy:
+### LinkedIn Profile Collector v1.3
+
+Plugin key: `linkedin_profile_collector_v1`
+
+This older collector is still available. It visits supplied profile URLs and
+saves best-effort structured profile fields, visible page text, screenshots, and
+HTML snapshots under:
 
 ```text
-queries/linkedin_profile_collector_v1.py
+data/linkedin_profiles.db
+data/linkedin_snapshots/
+data/linkedin_exports/
 ```
 
-into your existing app's `queries` folder.
+Use this module when you want structured fields such as profile name, headline,
+location, current title/company, experience snippets, education snippets, and
+full visible text. Use Evidence Capture v1.9 when preservation of screenshots,
+HTML, and detail sections is the priority.
 
-Also apply the small `app.py` patch described in `app_upload_patch.py`. The key change is that the query form needs:
-
-```html
-<form method="post" action="/run" enctype="multipart/form-data" onsubmit="return showRunningMessage(event, this);">
-```
-
-and `/run` should use the included `form_with_uploads(request)` helper instead of only `request.form.to_dict(flat=True)`.
-
-## CSV format
+## CSV Input
 
 Preferred columns:
 
 ```csv
 person_name,linkedin_url,notes
-Jane Smith,https://www.linkedin.com/in/jane-smith-12345/,PFL steering committee
-John Doe,https://www.linkedin.com/in/johndoe/,Board member
+Jane Smith,https://www.linkedin.com/in/jane-smith-12345/,board member
+John Doe,https://www.linkedin.com/in/johndoe/,campaign contact
 ```
 
-Also accepted column names:
+Accepted name columns include:
 
-- Name: `person_name`, `name`, `person`, `full_name`
-- URL: `linkedin_url`, `profile_url`, `url`, `link`, `hyperlink`
-- Notes: `notes`, `note`, `context`
+- `person_name`
+- `name`
+- `person`
+- `full_name`
 
-## First run workflow
+Accepted URL columns include:
 
-1. Start your Flask app.
-2. Select **LinkedIn Profile Collector v1**.
-3. Upload your CSV or paste CSV text.
-4. Set a small Max Profiles number for the first test, such as 2 or 3.
-5. Click **Run Query**.
-6. A visible Chromium browser window opens.
-7. Log into LinkedIn manually and complete any 2FA/challenge.
-8. The module proceeds through the profile list.
-9. Results are stored in:
+- `linkedin_url`
+- `profile_url`
+- `url`
+- `link`
+- `hyperlink`
+
+Accepted notes columns include:
+
+- `notes`
+- `note`
+- `context`
+
+## First Run Workflow
+
+1. Install dependencies with `pip install -r requirements.txt`.
+2. Install the browser runtime if needed:
+
+   ```bash
+   python -m playwright install chromium
+   ```
+
+3. Start the Flask app with `python app.py`.
+4. Select a LinkedIn module.
+5. Upload a CSV or paste CSV text.
+6. Start with a small `Max profiles` value, such as 2 or 3.
+7. Keep the browser visible for the first run.
+8. Click **Run Query**.
+9. Log into LinkedIn manually in the opened browser and complete any challenge.
+10. Let the module proceed through the supplied profiles.
+
+The browser session is stored locally under `data/`, so you usually do not need
+to log in again until LinkedIn expires the session.
+
+## Recommended Settings
+
+Start conservatively:
 
 ```text
-data/linkedin_profiles.db
-data/linkedin_snapshots/
-```
-
-The browser session is stored in:
-
-```text
-data/linkedin_browser_profile/
-```
-
-That means you usually do not need to log in again every run unless LinkedIn expires the session.
-
-## Recommended settings
-
-Start with:
-
-```text
-Max profiles: 3
+Max profiles: 2-3
 Delay between profiles: 8-15 seconds
-Login wait: 10 minutes
+Login wait: 10-15 minutes
 Headless: No
 Save HTML: Yes
 Save screenshots: Yes
 ```
 
-For larger batches, keep the delay conservative. Do not use this for aggressive automated scraping.
+For larger batches, keep delays conservative and be prepared for LinkedIn to
+challenge, throttle, or restrict the session. The modules pause or fail rather
+than trying to evade those controls.
 
-## Notes and limitations
+## Boundaries And Limitations
 
-- This does not bypass CAPTCHA, 2FA, login challenges, rate limits, or access controls.
-- This does not store your LinkedIn credentials.
-- If LinkedIn blocks, challenges, or restricts the session, the module pauses/fails rather than trying to evade it.
-- Structured fields may need tuning after you test against real profile pages because LinkedIn markup varies by account, connection level, and page layout.
+- These modules collect only content visible to the logged-in browser session
+  you control.
+- They do not store credentials.
+- They do not bypass CAPTCHA, 2FA, login challenges, rate limits, or access
+  controls.
+- Structured extraction is best effort because LinkedIn markup changes often.
+- Screenshots, HTML snapshots, and visible text are the evidentiary fallback.
