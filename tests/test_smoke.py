@@ -41,7 +41,8 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn("Facebook Page Posts &amp; Comments", body)
         self.assertIn("Resources", body)
         self.assertIn("save-oregon-schools-logo.png", body)
-        self.assertIn('href="https://github.com/SaveOregonSchools"', body)
+        self.assertIn('href="https://github.com/SaveOregonSchools/osint-tool"', body)
+        self.assertIn('href="https://github.com/SaveOregonSchools/osint-tool/blob/main/LICENSE"', body)
         self.assertIn("Save Oregon Schools, LLC", body)
         self.assertNotIn("Preview row limit", body)
 

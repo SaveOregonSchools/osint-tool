@@ -44,6 +44,10 @@ The current integrations cover:
 - Exposes `/health` for a simple app/plugin smoke check.
 - Exposes `/resources` for the evidence checklist and investigator tool links.
 
+The header includes the Save Oregon Schools logo linking to
+`https://www.saveoregonschools.com/`, and the footer includes the Save Oregon
+Schools copyright, source code, and license links.
+
 ## Integration Guides
 
 - [Bluesky integration](README-Bluesky.md)
@@ -236,3 +240,16 @@ python -m compileall app.py common.py osint_common.py providers queries tests
 
 The GitHub Actions workflow in `.github/workflows/ci.yml` runs pytest and a
 Python compile check on pushes and pull requests.
+
+## License
+
+The Social OSINT Query Console's software code is copyright (C) 2026 Save
+Oregon Schools, LLC and is licensed under the GNU Affero General Public License
+version 3. See `LICENSE` for the full license text.
+
+The Social OSINT Query Console is distributed without any warranty; without even
+the implied warranty of merchantability or fitness for a particular purpose.
+
+The Save Oregon Schools name, logo, and related branding are not licensed for
+reuse under the GNU Affero General Public License. See `TRADEMARKS.md` for the
+project's trademark and branding notice.

@@ -337,7 +337,9 @@ LAYOUT_END = """
   Copyright &copy; {{ year }} Save Oregon Schools, LLC.
   <a href="https://www.saveoregonschools.com">www.saveoregonschools.com</a>
   |
-  <a href="https://github.com/SaveOregonSchools">Check out all our apps on GitHub</a>
+  <a href="https://github.com/SaveOregonSchools/osint-tool">Source code</a>
+  |
+  <a href="https://github.com/SaveOregonSchools/osint-tool/blob/main/LICENSE">AGPLv3 license</a>
 </footer>
 </body>
 """
