@@ -23,6 +23,7 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn("meta_ad_library_enhanced", plugins)
         self.assertIn("meta_facebook_page_content_search", plugins)
         self.assertIn("osint_wayback_lookup", plugins)
+        self.assertIn("social_media_archive", plugins)
         self.assertIn("web_page_inspector", plugins)
         self.assertIn("tiktok_research_video_search", plugins)
         self.assertIn("youtube_channel_scan", plugins)
@@ -41,8 +42,10 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn("Platform APIs", body)
         self.assertIn("X Recent Search", body)
         self.assertIn("Facebook Page Posts &amp; Comments", body)
+        self.assertIn("Social Media Archive", body)
         self.assertIn("Web Page Technology &amp; Data-Flow Inspector", body)
         self.assertIn("Resources", body)
+        self.assertIn("Jobs", body)
         self.assertIn("save-oregon-schools-logo.png", body)
         self.assertIn('href="https://github.com/SaveOregonSchools/osint-tool"', body)
         self.assertIn('href="https://github.com/SaveOregonSchools/osint-tool/blob/main/LICENSE"', body)
@@ -105,6 +108,61 @@ class AppSmokeTests(unittest.TestCase):
         body = response.get_data(as_text=True)
         self.assertIn("Evidence Checklist", body)
         self.assertIn("Bellingcat Online Investigation Toolkit", body)
+
+    def test_jobs_page_renders_persistent_queue_results(self):
+        fake_job = {
+            "id": "abc12345deadbeef",
+            "group_id": "archive-group",
+            "module_key": "social_media_archive",
+            "label": "X: example — 2024",
+            "status": "completed",
+            "progress_current": 1,
+            "progress_total": 1,
+            "message": "Completed",
+            "created_at": "2026-07-30T12:00:00+00:00",
+            "error": "",
+            "result": {"wacz_path": "runs/example/example.wacz", "output_dir": "C:\\example"},
+        }
+        app.app.config.update(TESTING=True)
+        with patch.object(app, "ensure_registry"), patch.object(app, "start_worker"), patch.object(
+            app, "list_jobs", return_value=[fake_job]
+        ), patch.object(
+            app, "queue_counts", return_value={"queued": 0, "running": 0, "completed": 1, "failed": 0}
+        ):
+            with app.app.test_client() as client:
+                response = client.get("/jobs")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_data(as_text=True)
+        self.assertIn("Background Jobs", body)
+        self.assertIn("X: example", body)
+        self.assertIn("Open output folder", body)
+
+    def test_job_output_folder_action_opens_only_project_data(self):
+        output_dir = Path(app.__file__).resolve().parent / "data" / "social_media_archive" / "profiles"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        fake_job = {"result": {"output_dir": str(output_dir)}}
+        app.app.config.update(TESTING=True)
+        with patch.object(app, "ensure_registry"), patch.object(app, "get_job", return_value=fake_job), patch.object(
+            app.os, "startfile", create=True
+        ) as startfile:
+            with app.app.test_client() as client:
+                response = client.post("/jobs/example/open-folder")
+
+        self.assertEqual(response.status_code, 302)
+        startfile.assert_called_once_with(str(output_dir.resolve()))
+
+    def test_job_output_folder_action_rejects_outside_path(self):
+        fake_job = {"result": {"output_dir": str(Path(app.__file__).resolve().parent.parent)}}
+        app.app.config.update(TESTING=True)
+        with patch.object(app, "ensure_registry"), patch.object(app, "get_job", return_value=fake_job), patch.object(
+            app.os, "startfile", create=True
+        ) as startfile:
+            with app.app.test_client() as client:
+                response = client.post("/jobs/example/open-folder")
+
+        self.assertEqual(response.status_code, 400)
+        startfile.assert_not_called()
 
     def test_health_endpoint_reports_loaded_plugins(self):
         app.app.config.update(TESTING=True)

@@ -4,6 +4,7 @@ import csv
 import importlib
 import io
 import json
+import os
 import pkgutil
 import sys
 import traceback
@@ -13,6 +14,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from flask import Flask, Response, redirect, render_template_string, request, url_for
+from job_queue import get_job, list_jobs, queue_counts, start_worker
 from osint_common import enforce_source_access
 
 load_dotenv()
@@ -322,6 +324,7 @@ LAYOUT_START = """
     <h1>Social OSINT - Query Console</h1>
   </div>
   <div class="nav-links">
+    <a class="button-link" href="{{ url_for('jobs_page') }}">Jobs</a>
     <a class="button-link" href="{{ url_for('resources') }}">Resources</a>
     <a class="brand-link" href="https://www.saveoregonschools.com" aria-label="Save Oregon Schools website">
       <img class="brand-logo" src="{{ url_for('static', filename='save-oregon-schools-logo.png') }}" alt="Save Oregon Schools">
@@ -388,6 +391,11 @@ HOME_MENU = [
     (
         "Browser-Assisted",
         [
+            (
+                "social_media_archive",
+                "Social Media Archive",
+                "Create authenticated Browsertrix WACZ archives for Facebook, Instagram, and X, with yearly X search batches.",
+            ),
             (
                 "web_page_inspector",
                 "Web Page Technology & Data-Flow Inspector",
@@ -727,6 +735,94 @@ def resources():
 @app.route("/evidence-checklist", methods=["GET"])
 def evidence_checklist():
     return redirect(url_for("resources") + "#evidence-checklist")
+
+
+JOBS_HTML = LAYOUT_START + """
+<div class="home-title-row">
+  <h2>Background Jobs</h2>
+  <p class="note">Persistent queue for long-running collection work</p>
+</div>
+
+<div class="notice">
+  <span class="pill">Queued: {{ counts.queued }}</span>
+  <span class="pill">Running: {{ counts.running }}</span>
+  <span class="pill">Completed: {{ counts.completed }}</span>
+  <span class="pill">Failed: {{ counts.failed }}</span>
+  {% if active %}<span class="subtle">This page refreshes every five seconds while work is active.</span>{% endif %}
+</div>
+
+{% if jobs %}
+<div class="results" style="max-height:72vh;">
+  <table>
+    <thead><tr><th>Submitted</th><th>Module</th><th>Job</th><th>Status</th><th>Progress</th><th>Output</th><th>Details</th></tr></thead>
+    <tbody>
+    {% for job in jobs %}
+      <tr>
+        <td>{{ job.created_at }}</td>
+        <td>{{ job.module_key }}</td>
+        <td class="wrap"><b>{{ job.label }}</b><br><span class="subtle">{{ job.id[:8] }} · group {{ job.group_id[:12] }}</span></td>
+        <td><span class="source-badge">{{ job.status }}</span></td>
+        <td class="wrap">{{ job.progress_current }}/{{ job.progress_total }}<br><span class="subtle">{{ job.message }}</span></td>
+        <td class="wrap">
+          {% if job.result.get('status') %}<b>{{ job.result.get('status') }}</b><br>{% endif %}
+          {% if job.result.get('wacz_path') %}<code>{{ job.result.get('wacz_path') }}</code><br>{% endif %}
+          {% if job.result.get('wacz_bytes') %}<span class="subtle">{{ job.result.get('wacz_bytes') }} bytes</span><br>{% endif %}
+          {% if job.result.get('sha256') %}<span class="subtle">SHA-256: {{ job.result.get('sha256') }}</span><br>{% endif %}
+          {% if job.result.get('output_dir') %}
+            <form method="post" action="{{ url_for('open_job_folder', job_id=job.id) }}" style="margin-top:6px;">
+              <button class="secondary" type="submit">Open output folder</button>
+            </form>
+          {% endif %}
+        </td>
+        <td class="wrap">
+          {% if job.result.get('target_url') %}<a href="{{ job.result.get('target_url') }}" target="_blank" rel="noreferrer">Open target</a><br>{% endif %}
+          {% if job.error %}<span class="err" style="display:block;margin-top:5px;">{{ job.error }}</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+  <div class="panel"><p>No background jobs have been submitted yet.</p></div>
+{% endif %}
+
+{% if active %}<script>setTimeout(function () { window.location.reload(); }, 5000);</script>{% endif %}
+""" + LAYOUT_END
+
+
+@app.route("/jobs", methods=["GET"])
+def jobs_page():
+    ensure_registry()
+    start_worker()
+    jobs = list_jobs()
+    counts = queue_counts()
+    return render_template_string(
+        JOBS_HTML,
+        **_template_context(
+            title="Social OSINT - Background Jobs",
+            jobs=jobs,
+            counts=counts,
+            active=bool(counts.get("queued") or counts.get("running")),
+        ),
+    )
+
+
+@app.route("/jobs/<job_id>/open-folder", methods=["POST"])
+def open_job_folder(job_id: str):
+    ensure_registry()
+    job = get_job(job_id)
+    if not job:
+        return "Unknown job.", 404
+    output_dir = str((job.get("result") or {}).get("output_dir") or "")
+    if not output_dir:
+        return "This job does not have an output folder yet.", 400
+    target = Path(output_dir).resolve()
+    data_root = (Path(__file__).resolve().parent / "data").resolve()
+    if not target.is_relative_to(data_root) or not target.is_dir():
+        return "The recorded output folder is unavailable or outside the project data directory.", 400
+    os.startfile(str(target))
+    return redirect(url_for("jobs_page"))
 
 
 @app.route("/query/<qkey>", methods=["GET"])

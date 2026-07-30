@@ -24,6 +24,8 @@ The current integrations cover:
 - Optional Instaloader local runner support, disabled by default.
 - Browser-assisted LinkedIn profile/evidence capture for pages visible to a
   logged-in browser session you control.
+- Browsertrix WACZ archiving for user-supplied Facebook, Instagram, and X
+  targets, including date-bounded X searches and separate yearly collections.
 - Public webpage technology and data-flow inspection, with static HTML analysis
   and optional rendered network, cookie-name, and storage-key observation.
 
@@ -44,6 +46,8 @@ The current integrations cover:
 - Keeps local data, evidence captures, browser sessions, exports, and caches out
   of Git.
 - Exposes `/health` for a simple app/plugin smoke check.
+- Provides a persistent background-job queue and `/jobs` dashboard for
+  long-running modules, including direct access to completed output folders.
 - Exposes `/resources` for the evidence checklist and investigator tool links.
 
 The header includes the Save Oregon Schools logo linking to
@@ -56,6 +60,7 @@ Schools copyright, source code, and license links.
 - [Facebook Page content integration](README-Facebook.md)
 - [Instagram / Meta Ad Library integration](README-Instagram.md)
 - [LinkedIn integration](README-LinkedIn.md)
+- [Social media archiving](README-Social-Archive.md)
 - [X integration](README-X.md)
 
 ## Web Page Inspector
