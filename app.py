@@ -389,6 +389,11 @@ HOME_MENU = [
         "Browser-Assisted",
         [
             (
+                "web_page_inspector",
+                "Web Page Technology & Data-Flow Inspector",
+                "Inspect public page metadata, technology signals, resources, forms, storage, and third-party destinations.",
+            ),
+            (
                 "linkedin_profile_collector_v1",
                 "LinkedIn Profile Collector",
                 "Open a browser you control, then collect fields visible to your logged-in session.",
@@ -535,6 +540,10 @@ QUERY_HTML = LAYOUT_START + """
 {% endif %}
 
 <script>
+  {% if normalize_query_url %}
+  window.history.replaceState(null, document.title, {{ query_page_url | tojson }});
+  {% endif %}
+
   function showRunningMessage(event, form) {
     document.body.classList.add("is-running");
     const submitter = event.submitter;
@@ -641,6 +650,7 @@ def _render_query(
     rows: list[list[Any]] | None = None,
     error: str | None = None,
     result_actions: str = "",
+    normalize_query_url: bool = False,
 ) -> str:
     ensure_registry()
     custom_results_html = None
@@ -659,6 +669,8 @@ def _render_query(
             error=error,
             result_actions=result_actions,
             custom_results_html=custom_results_html,
+            normalize_query_url=normalize_query_url,
+            query_page_url=url_for("query_page", qkey=qkey),
             hide_preview_limit=_module_flag(qkey, "HIDE_PREVIEW_LIMIT"),
             hide_csv_export=_module_flag(qkey, "HIDE_CSV_EXPORT"),
             run_button_label=getattr(REGISTRY[qkey], "RUN_BUTTON_LABEL", "Run Preview") if qkey in REGISTRY else "Run Preview",
@@ -775,7 +787,15 @@ def run():
     except Exception:
         error = traceback.format_exc()
 
-    return _render_query(qkey, form=form, headers=headers, rows=rows, error=error, result_actions=result_actions_html)
+    return _render_query(
+        qkey,
+        form=form,
+        headers=headers,
+        rows=rows,
+        error=error,
+        result_actions=result_actions_html,
+        normalize_query_url=True,
+    )
 
 
 @app.route("/plugin_action", methods=["POST"])

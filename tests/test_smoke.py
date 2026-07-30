@@ -1,6 +1,7 @@
 import unittest
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import app
 import osint_common
@@ -22,6 +23,7 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn("meta_ad_library_enhanced", plugins)
         self.assertIn("meta_facebook_page_content_search", plugins)
         self.assertIn("osint_wayback_lookup", plugins)
+        self.assertIn("web_page_inspector", plugins)
         self.assertIn("tiktok_research_video_search", plugins)
         self.assertIn("youtube_channel_scan", plugins)
         self.assertIn("x_recent_search", plugins)
@@ -39,6 +41,7 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn("Platform APIs", body)
         self.assertIn("X Recent Search", body)
         self.assertIn("Facebook Page Posts &amp; Comments", body)
+        self.assertIn("Web Page Technology &amp; Data-Flow Inspector", body)
         self.assertIn("Resources", body)
         self.assertIn("save-oregon-schools-logo.png", body)
         self.assertIn('href="https://github.com/SaveOregonSchools/osint-tool"', body)
@@ -57,6 +60,40 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn('aria-label="Home"', body)
         self.assertIn("Preview row limit", body)
         self.assertIn("Data access mode", body)
+
+    def test_run_replaces_post_url_with_query_url_for_safe_refresh(self):
+        class FakeQuery:
+            META = {
+                "key": "web_page_inspector",
+                "name": "Web Page Inspector",
+                "description": "Test query",
+                "source_type": "public_web",
+            }
+
+            @staticmethod
+            def render_fields(form):
+                return '<input name="urls">'
+
+            @staticmethod
+            def run(form):
+                return ["result"], [["ok"]]
+
+            @staticmethod
+            def export_rows(form):
+                yield ["ok"]
+
+        app.app.config.update(TESTING=True)
+        app.REGISTRY = {"web_page_inspector": FakeQuery}
+        with patch.object(app, "ensure_registry", return_value=None):
+            with app.app.test_client() as client:
+                response = client.post(
+                    "/run",
+                    data={"qkey": "web_page_inspector", "data_access_mode": "official", "urls": "https://example.org/"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_data(as_text=True)
+        self.assertIn('window.history.replaceState(null, document.title, "/query/web_page_inspector")', body)
 
     def test_resources_page_renders_evidence_checklist(self):
         app.app.config.update(TESTING=True)

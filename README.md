@@ -24,6 +24,8 @@ The current integrations cover:
 - Optional Instaloader local runner support, disabled by default.
 - Browser-assisted LinkedIn profile/evidence capture for pages visible to a
   logged-in browser session you control.
+- Public webpage technology and data-flow inspection, with static HTML analysis
+  and optional rendered network, cookie-name, and storage-key observation.
 
 ## Core App Capabilities
 
@@ -55,6 +57,45 @@ Schools copyright, source code, and license links.
 - [Instagram / Meta Ad Library integration](README-Instagram.md)
 - [LinkedIn integration](README-LinkedIn.md)
 - [X integration](README-X.md)
+
+## Web Page Inspector
+
+Open **Web Page Technology & Data-Flow Inspector** under **Browser-Assisted**.
+Enter up to ten public HTTP/HTTPS page URLs. The default real-browser mode also
+runs a static pass when the site permits it. Static inspection reports:
+
+- page metadata, JSON-LD, response headers, and cookie names/attributes;
+- referenced scripts, styles, images, frames, and off-site hostnames;
+- declared forms, submission destinations, methods, and field names/types;
+- common CMS, framework, analytics, tag-manager, consent, CDN, and marketing
+  technology signals; and
+- inline-script references to browser storage and data-transfer APIs.
+
+The default rendered pass uses a fresh temporary Playwright browser context to
+observe network request destinations/statuses, cookie names/attributes, and
+storage key names during a short page load. It does not click, submit forms,
+log in, or retain request bodies, cookie/storage values, or query-string values.
+Recognizable numeric software-version parameters may be retained separately as
+version hints; all other query values remain redacted.
+If a site rejects the plain static request but rendered observation was selected,
+the inspector reports that rejection and continues with the browser pass.
+If a submitted hostname cannot establish a connection, the inspector may try its
+`www`-prefixed alternative and records that fallback rather than presenting it as
+an observed redirect.
+Rendered mode blocks private/local destinations, non-standard ports, service
+workers, and WebSockets. If Chromium is not installed yet, run
+`playwright install chromium`. To keep the browser runtime in the project's
+ignored `data` directory on Windows PowerShell, use:
+
+```powershell
+$env:PLAYWRIGHT_BROWSERS_PATH="$PWD\data\playwright-browsers"
+$env:NODE_OPTIONS="--use-system-ca"
+.\.venv\Scripts\playwright.exe install chromium
+```
+
+Results identify direct observations, site-provided claims, and signature-based
+inferences separately. A referenced third party or API name does not by itself
+prove what personal data was collected, retained, sold, or otherwise used.
 
 ## Current Expansion Notes
 
@@ -92,6 +133,8 @@ Important platform caveats:
 - It does not bypass platform access controls, rate limits, login challenges,
   CAPTCHA, 2FA, or privacy settings.
 - It does not collect deleted, private, or restricted content.
+- The webpage inspector does not scan private networks, use non-standard ports,
+  submit forms, collect request bodies, or retain cookie/storage/query values.
 - It does not determine whether conduct is illegal. Flags are leads for
   human/legal/compliance review.
 - It does not replace screenshots, archives, or other evidence-preservation
@@ -112,6 +155,12 @@ Then open:
 ```text
 http://127.0.0.1:5000
 ```
+
+On Windows, after the environment and requirements have been created, you can
+instead double-click `start-osint-tool.bat` in the project root. The launcher
+always uses `.venv\Scripts\python.exe`, configures the project-local Playwright
+browser directory, installs Chromium there if it is missing, and starts Flask
+without the development auto-reloader.
 
 For development and tests, install the dev requirements instead:
 
