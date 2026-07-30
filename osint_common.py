@@ -41,14 +41,15 @@ SOURCE_TYPES = {
     "official_api",
     "approved_research_api",
     "public_archive",
+    "public_web",
     "third_party_api",
     "unofficial_local_tool",
     "manual_entry",
 }
 
 DATA_ACCESS_MODES = {
-    "official": {"official_api", "public_archive", "manual_entry"},
-    "approved": {"official_api", "approved_research_api", "public_archive", "manual_entry"},
+    "official": {"official_api", "public_archive", "public_web", "manual_entry"},
+    "approved": {"official_api", "approved_research_api", "public_archive", "public_web", "manual_entry"},
     "unofficial": set(SOURCE_TYPES),
 }
 
