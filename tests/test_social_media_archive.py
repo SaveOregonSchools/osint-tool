@@ -125,6 +125,63 @@ class SocialMediaArchiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][headers.index("status")], "planned — profile missing")
 
+    def test_empty_plan_has_clear_target_validation_message(self):
+        with self.assertRaisesRegex(ValueError, "Specify at least one target profile or URL"):
+            social_media_archive.build_plan({})
+
+    def test_successful_plan_results_offer_forced_archive_action(self):
+        batch = ArchiveBatch(
+            batch_id="batch-0001",
+            platform="x",
+            label="example — 2024",
+            seed_url="https://x.com/search?q=from%3Aexample",
+            collection="x-example-2024",
+            query_text="from:example since:2024-01-01 until:2025-01-01",
+            period_start="2024-01-01",
+            period_end="2024-12-31",
+        )
+        result = social_media_archive._planned_result(batch, profile_exists=True)
+        form = {
+            "qkey": "social_media_archive",
+            "operation": "plan",
+            "data_access_mode": "official",
+            "x_accounts": "example",
+            "x_start": "2024-01-01",
+            "x_end": "2024-12-31",
+            "batch_mode": "year",
+            "profile_filename": "social-auth.tar.gz",
+        }
+
+        rendered = social_media_archive.render_results(
+            form, social_media_archive.HEADERS, [social_media_archive._result_row(result)]
+        )
+
+        self.assertIn(">Run Archiving</button>", rendered)
+        self.assertIn('name="operation" value="archive"', rendered)
+        self.assertNotIn('name="operation" value="plan"', rendered)
+        self.assertIn('name="x_accounts" value="example"', rendered)
+        self.assertIn('id="archive-plan-results"', rendered)
+        self.assertIn("scrollIntoView", rendered)
+
+    def test_plan_with_missing_profile_does_not_offer_archive_action(self):
+        batch = ArchiveBatch(
+            batch_id="batch-0001",
+            platform="facebook",
+            label="example",
+            seed_url="https://www.facebook.com/example",
+            collection="facebook-example",
+        )
+        result = social_media_archive._planned_result(batch, profile_exists=False)
+
+        rendered = social_media_archive.render_results(
+            {"operation": "plan", "profile_filename": "missing.tar.gz"},
+            social_media_archive.HEADERS,
+            [social_media_archive._result_row(result)],
+        )
+
+        self.assertNotIn(">Run Archiving</button>", rendered)
+        self.assertIn("scrollIntoView", rendered)
+
     def test_archive_operation_queues_each_batch_without_running_inline(self):
         form = {
             "operation": "archive",

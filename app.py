@@ -260,6 +260,11 @@ BASE_CSS = """
     border-color: var(--border);
   }
   button.secondary:hover { background: var(--panel); }
+  button.success {
+    background: #178447;
+    border-color: #116837;
+  }
+  button.success:hover { background: #116837; }
   .panel { border: 1px solid var(--border); border-radius: 8px; padding: 12px; background: #fff; margin: 12px 0; }
   .row { margin: 10px 0; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px 16px; }
@@ -522,7 +527,12 @@ QUERY_HTML = LAYOUT_START + """
   </div>
 
   {% if error %}
-    <div class="err"><b>Error:</b>\n{{ error }}</div>
+    <div class="err" id="query-error"><b>Please correct the following:</b>\n{{ error }}</div>
+    <script>
+      window.addEventListener("load", function () {
+        document.getElementById("query-error").scrollIntoView({ behavior: "smooth", block: "center" });
+      });
+    </script>
   {% endif %}
 
   {% if headers and rows is not none %}
@@ -880,6 +890,8 @@ def run():
                 result_actions_html = REGISTRY[qkey].result_actions(form, headers, rows)
             except Exception:
                 result_actions_html = ""
+    except ValueError as exc:
+        error = str(exc)
     except Exception:
         error = traceback.format_exc()
 

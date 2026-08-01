@@ -98,6 +98,43 @@ class AppSmokeTests(unittest.TestCase):
         body = response.get_data(as_text=True)
         self.assertIn('window.history.replaceState(null, document.title, "/query/web_page_inspector")', body)
 
+    def test_validation_error_is_friendly_without_traceback(self):
+        class InvalidQuery:
+            META = {
+                "key": "social_media_archive",
+                "name": "Social Media Archive",
+                "description": "Test query",
+                "source_type": "manual_entry",
+            }
+
+            @staticmethod
+            def render_fields(form):
+                return '<textarea name="facebook_urls"></textarea>'
+
+            @staticmethod
+            def run(form):
+                raise ValueError("Specify at least one target profile or URL.")
+
+            @staticmethod
+            def export_rows(form):
+                return iter(())
+
+        app.app.config.update(TESTING=True)
+        app.REGISTRY = {"social_media_archive": InvalidQuery}
+        with patch.object(app, "ensure_registry", return_value=None):
+            with app.app.test_client() as client:
+                response = client.post(
+                    "/run",
+                    data={"qkey": "social_media_archive", "data_access_mode": "official"},
+                )
+
+        body = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Please correct the following", body)
+        self.assertIn("Specify at least one target profile or URL", body)
+        self.assertNotIn("Traceback", body)
+        self.assertIn('id="query-error"', body)
+
     def test_resources_page_renders_evidence_checklist(self):
         app.app.config.update(TESTING=True)
 
