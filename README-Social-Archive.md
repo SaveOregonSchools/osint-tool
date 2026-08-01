@@ -56,8 +56,11 @@ This directory is ignored by Git.
 3. For X, select an inclusive start and end date. Keep yearly batching enabled
    for long periods.
 4. Run the plan and review every generated target and date period.
-5. Select **Queue WACZ archives** and submit the operation. Each platform/year
-   batch becomes a persistent background job and the module returns immediately.
+5. Select the green **Run Archiving** button below a successful plan. It preserves
+   the submitted settings and queues the plan without requiring another dropdown
+   change. You can alternatively select **Queue WACZ archives** before submitting.
+   Each platform/year batch becomes a persistent background job and the module
+   returns immediately.
 6. Open **Jobs** in the app header to follow queued, running, completed, and
    failed work. The page refreshes automatically while work is active.
 7. Use **Open output folder** beside a finished job to open its run directory

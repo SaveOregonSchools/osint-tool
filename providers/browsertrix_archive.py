@@ -239,7 +239,9 @@ def build_archive_plan(
                 )
 
     if not batches:
-        raise ValueError("Enter at least one Facebook URL, Instagram URL, X account, or X search expression.")
+        raise ValueError(
+            "Specify at least one target profile or URL for Facebook, Instagram, and/or X before previewing or queueing an archive."
+        )
     return batches
 
 

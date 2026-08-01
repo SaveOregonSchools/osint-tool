@@ -349,6 +349,20 @@ def export_rows(form: dict[str, Any]) -> Iterable[list[Any]]:
         yield _result_row(_planned_result(batch, profile_exists))
 
 
+def _archive_submit_fields(form: dict[str, Any]) -> str:
+    fields: list[str] = []
+    values = {str(key): value for key, value in form.items() if key != "_files" and key != "operation"}
+    values["qkey"] = META["key"]
+    values["operation"] = "archive"
+    for name, value in values.items():
+        if isinstance(value, (str, int, float)):
+            fields.append(
+                f'<input type="hidden" name="{html.escape(name, quote=True)}" '
+                f'value="{html.escape(str(value), quote=True)}">'
+            )
+    return "".join(fields)
+
+
 def render_results(form: dict[str, Any], headers: list[str], rows: list[list[Any]]) -> str:
     status_index = headers.index("status")
     completed = sum(1 for row in rows if str(row[status_index]).startswith("completed"))
@@ -357,6 +371,19 @@ def render_results(form: dict[str, Any], headers: list[str], rows: list[list[Any
     planned = len(rows) - completed - failed - queued
     summary = f"{queued} queued, {completed} completed, {failed} failed, {planned} planned"
     profile_path = _profile_path(form)
+    operation = str(form.get("operation") or "plan")
+    error_index = headers.index("error")
+    can_run_archive = bool(rows) and operation == "plan" and all(
+        str(row[status_index]) == "planned" and not str(row[error_index]) for row in rows
+    )
+    archive_action = ""
+    if can_run_archive:
+        archive_action = f"""
+        <form method="post" action="/run" onsubmit="return showRunningMessage(event, this);" style="margin:12px 0 14px;">
+          {_archive_submit_fields(form)}
+          <button class="success" type="submit">Run Archiving</button>
+        </form>
+        """
 
     table_rows = []
     indexes = {name: headers.index(name) for name in headers}
@@ -376,15 +403,28 @@ def render_results(form: dict[str, Any], headers: list[str], rows: list[list[Any
             f"<td class=\"wrap\">{html.escape(error)}</td>"
             "</tr>"
         )
+    auto_scroll = ""
+    if operation == "plan":
+        auto_scroll = """
+        <script>
+          window.addEventListener("load", function () {
+            document.getElementById("archive-plan-results").scrollIntoView({ behavior: "smooth", block: "start" });
+          });
+        </script>
+        """
     return f"""
+    <div id="archive-plan-results">
     <div class="notice">
       <b>Archive result:</b> {h(summary)}.<br>
       <span class="subtle">You may leave this page while queued jobs run. Follow progress and open output folders on the <a href="/jobs"><b>Jobs page</b></a>. Authenticated profile: <code>{h(profile_path)}</code>.</span>
     </div>
+    {archive_action}
     <div class="results"><table>
       <thead><tr><th>Platform</th><th>Batch</th><th>From</th><th>Through</th><th>Target</th><th>Status</th><th>WACZ</th><th>Error</th></tr></thead>
       <tbody>{''.join(table_rows)}</tbody>
     </table></div>
+    </div>
+    {auto_scroll}
     """
 
 
