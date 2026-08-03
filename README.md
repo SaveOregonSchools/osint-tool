@@ -202,6 +202,9 @@ export OSINT_DB_PATH="C:\Projects\osint-tool\data\osint_cache.db"
 # official, approved, or unofficial
 export OSINT_DATA_ACCESS_MODE="official"
 
+# Optional parent launcher link shown in the application header
+export TOOLBOX_HOME_URL="/"
+
 # Google / YouTube
 export GOOGLE_CLOUD_PROJECT="your_google_cloud_project"
 export GOOGLE_APPLICATION_CREDENTIALS="C:\path\to\service-account.json"
