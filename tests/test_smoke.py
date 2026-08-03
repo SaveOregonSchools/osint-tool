@@ -1,4 +1,5 @@
 import unittest
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -211,6 +212,73 @@ class AppSmokeTests(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(payload["ok"], True)
         self.assertIn("bluesky_profile_lookup", payload["plugins"])
+
+    def test_automation_api_submits_and_returns_queue_urls(self):
+        class FakeArchive:
+            @staticmethod
+            def enqueue_profile_review(payload):
+                self.assertEqual(payload["lookback"]["unit"], "weeks")
+                return {"job_id": "abc123", "status": "queued"}
+
+        app.app.config.update(TESTING=True)
+        app.REGISTRY = {"social_media_archive": FakeArchive}
+        with patch.dict(app.os.environ, {"OSINT_AUTOMATION_API_TOKEN": "test-token"}), patch.object(
+            app, "ensure_registry"
+        ):
+            with app.app.test_client() as client:
+                response = client.post(
+                    "/api/v1/social-profile-jobs",
+                    headers={"Authorization": "Bearer test-token"},
+                    json={"platform": "x", "profile": "example", "lookback": {"value": 3, "unit": "weeks"}},
+                )
+
+        self.assertEqual(response.status_code, 202)
+        payload = response.get_json()
+        self.assertEqual(payload["status_url"], "/api/v1/social-profile-jobs/abc123")
+        self.assertEqual(payload["content_url"], "/api/v1/social-profile-jobs/abc123/content")
+
+    def test_automation_api_requires_configured_bearer_token(self):
+        app.app.config.update(TESTING=True)
+        with patch.object(app.os, "getenv", return_value=""):
+            with app.app.test_client() as client:
+                response = client.post("/api/v1/social-profile-jobs", json={})
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["error"], "automation_api_not_configured")
+
+    def test_automation_content_endpoint_adds_protected_media_urls(self):
+        app.app.config.update(TESTING=True)
+        data_dir = Path(app.__file__).resolve().parent / "data"
+        data_dir.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=data_dir) as tmp:
+            content_dir = Path(tmp) / "content"
+            media_dir = content_dir / "media"
+            media_dir.mkdir(parents=True)
+            (media_dir / "0001-test.png").write_bytes(b"png")
+            content_path = content_dir / "content.json"
+            content_path.write_text(
+                json.dumps({"documents": [{"text": "post"}], "media": [{"file": "media/0001-test.png"}]}),
+                encoding="utf-8",
+            )
+            fake_job = {
+                "module_key": "social_media_archive",
+                "status": "completed",
+                "result": {"content_path": str(content_path)},
+            }
+            with patch.dict(app.os.environ, {"OSINT_AUTOMATION_API_TOKEN": "test-token"}), patch.object(
+                app, "get_job", return_value=fake_job
+            ):
+                with app.app.test_client() as client:
+                    response = client.get(
+                        "/api/v1/social-profile-jobs/job1/content",
+                        headers={"Authorization": "Bearer test-token"},
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["media"][0]["download_url"],
+            "/api/v1/social-profile-jobs/job1/media/0001-test.png",
+        )
 
     def test_osint_cache_schema_and_core_persistence(self):
         original_db_path = osint_common.OSINT_DB_PATH

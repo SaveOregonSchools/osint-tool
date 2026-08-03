@@ -6,6 +6,7 @@ import io
 import json
 import os
 import pkgutil
+import secrets
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from flask import Flask, Response, redirect, render_template_string, request, url_for
+from flask import Flask, Response, redirect, render_template_string, request, send_file, url_for
 from job_queue import get_job, list_jobs, queue_counts, start_worker
 from osint_common import enforce_source_access
 
@@ -95,6 +96,37 @@ def request_payload() -> dict[str, Any]:
     form: dict[str, Any] = request.form.to_dict(flat=True)
     form["_files"] = request.files
     return form
+
+
+def _automation_api_auth_error() -> tuple[dict[str, Any], int] | None:
+    configured = str(os.getenv("OSINT_AUTOMATION_API_TOKEN") or "").strip()
+    if not configured:
+        return {
+            "error": "automation_api_not_configured",
+            "message": "Set OSINT_AUTOMATION_API_TOKEN before using the automation API.",
+        }, 503
+    supplied = str(request.headers.get("Authorization") or "")
+    if not supplied.startswith("Bearer ") or not secrets.compare_digest(supplied[7:].strip(), configured):
+        return {"error": "unauthorized", "message": "Supply the configured token as a Bearer token."}, 401
+    return None
+
+
+def _api_job(job_id: str) -> tuple[dict[str, Any] | None, tuple[dict[str, Any], int] | None]:
+    job = get_job(job_id)
+    if not job or job.get("module_key") != "social_media_archive":
+        return None, ({"error": "not_found", "message": "Unknown social profile review job."}, 404)
+    return job, None
+
+
+def _job_content_path(job: dict[str, Any]) -> Path | None:
+    value = str((job.get("result") or {}).get("content_path") or "")
+    if not value:
+        return None
+    target = Path(value).resolve()
+    data_root = (Path(__file__).resolve().parent / "data").resolve()
+    if not target.is_relative_to(data_root) or not target.is_file():
+        return None
+    return target
 
 
 def csv_row(values: list[Any] | tuple[Any, ...]) -> str:
@@ -1076,6 +1108,106 @@ def archive_urls():
 def health():
     ensure_registry()
     return {"ok": True, "plugins": list(REGISTRY.keys())}
+
+
+@app.route("/api/v1/social-profile-jobs", methods=["POST"])
+def create_social_profile_job():
+    auth_error = _automation_api_auth_error()
+    if auth_error:
+        return auth_error
+    if not request.is_json:
+        return {"error": "invalid_content_type", "message": "Send a JSON request body."}, 415
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return {"error": "invalid_json", "message": "The request body must be a JSON object."}, 400
+    ensure_registry()
+    module = REGISTRY.get("social_media_archive")
+    if module is None or not hasattr(module, "enqueue_profile_review"):
+        return {"error": "unavailable", "message": "The social media archive module is unavailable."}, 503
+    try:
+        result = module.enqueue_profile_review(payload)
+    except ValueError as exc:
+        return {"error": "validation_error", "message": str(exc)}, 400
+    except RuntimeError as exc:
+        return {"error": "submission_error", "message": str(exc)}, 503
+    job_id = str(result["job_id"])
+    result["status_url"] = url_for("social_profile_job_status", job_id=job_id)
+    result["content_url"] = url_for("social_profile_job_content", job_id=job_id)
+    return result, 202
+
+
+@app.route("/api/v1/social-profile-jobs/<job_id>", methods=["GET"])
+def social_profile_job_status(job_id: str):
+    auth_error = _automation_api_auth_error()
+    if auth_error:
+        return auth_error
+    job, error = _api_job(job_id)
+    if error:
+        return error
+    assert job is not None
+    response = {
+        key: job.get(key)
+        for key in (
+            "id",
+            "group_id",
+            "module_key",
+            "label",
+            "status",
+            "progress_current",
+            "progress_total",
+            "message",
+            "created_at",
+            "started_at",
+            "completed_at",
+            "error",
+            "result",
+        )
+    }
+    response["content_url"] = url_for("social_profile_job_content", job_id=job_id)
+    return response
+
+
+@app.route("/api/v1/social-profile-jobs/<job_id>/content", methods=["GET"])
+def social_profile_job_content(job_id: str):
+    auth_error = _automation_api_auth_error()
+    if auth_error:
+        return auth_error
+    job, error = _api_job(job_id)
+    if error:
+        return error
+    assert job is not None
+    if job.get("status") not in {"completed", "failed"}:
+        return {"error": "not_ready", "message": "The job has not finished yet.", "status": job.get("status")}, 409
+    content_path = _job_content_path(job)
+    if content_path is None:
+        message = str((job.get("result") or {}).get("content_error") or job.get("error") or "")
+        return {"error": "content_unavailable", "message": message or "No extracted content bundle is available."}, 404
+    try:
+        bundle = json.loads(content_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"error": "content_unavailable", "message": "The extracted content bundle could not be read."}, 500
+    for item in bundle.get("media", []):
+        filename = Path(str(item.get("file") or "")).name
+        item["download_url"] = url_for("social_profile_job_media", job_id=job_id, filename=filename)
+    return bundle
+
+
+@app.route("/api/v1/social-profile-jobs/<job_id>/media/<filename>", methods=["GET"])
+def social_profile_job_media(job_id: str, filename: str):
+    auth_error = _automation_api_auth_error()
+    if auth_error:
+        return auth_error
+    job, error = _api_job(job_id)
+    if error:
+        return error
+    assert job is not None
+    content_path = _job_content_path(job)
+    if content_path is None or Path(filename).name != filename:
+        return {"error": "not_found", "message": "Unknown media file."}, 404
+    media_path = (content_path.parent / "media" / filename).resolve()
+    if not media_path.is_relative_to(content_path.parent.resolve()) or not media_path.is_file():
+        return {"error": "not_found", "message": "Unknown media file."}, 404
+    return send_file(media_path)
 
 
 if __name__ == "__main__":

@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import html
 import uuid
-from dataclasses import asdict
-from datetime import date
+from dataclasses import asdict, replace
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
-from common import h, parse_int
+from common import get_form_bool, h, parse_int
 from job_queue import JobExecutionError, enqueue_job, register_job_handler
 from providers.browsertrix_archive import (
     DEFAULT_IMAGE,
+    PROFILE_REVIEW_BEHAVIORS,
     ArchiveBatch,
     ArchiveResult,
     CrawlSettings,
@@ -20,6 +21,7 @@ from providers.browsertrix_archive import (
     slugify,
     validate_image_name,
 )
+from providers.wacz_content import extract_wacz_content
 
 
 META = {
@@ -322,7 +324,7 @@ def run_queued_job(
     if Path(profile_filename).name != profile_filename or not profile_filename.casefold().endswith(".tar.gz"):
         raise JobExecutionError("Queued job contains an invalid browser profile filename.")
     run_id = slugify(str(payload.get("run_id") or "archive-job"), 120)
-    update_progress(0, 1, "Running Browsertrix capture")
+    update_progress(0, 2, "Running Browsertrix capture")
     run_dir, results = execute_archive_plan(
         batches=[batch],
         settings=settings,
@@ -332,10 +334,147 @@ def run_queued_job(
     )
     result = asdict(results[0])
     result["output_dir"] = str(run_dir.resolve())
-    update_progress(1, 1, result.get("status") or "Finished")
+    if payload.get("automation_request"):
+        result["automation_request"] = dict(payload["automation_request"])
+    if not str(result.get("status") or "").startswith("failed"):
+        wacz_value = str(result.get("wacz_path") or "")
+        wacz_path = Path(wacz_value)
+        if not wacz_path.is_absolute():
+            wacz_path = MODULE_DATA_DIR / wacz_path
+        update_progress(1, 2, "Packaging extracted text and graphics")
+        try:
+            result.update(extract_wacz_content(wacz_path, run_dir / "content"))
+        except Exception as exc:
+            result["content_error"] = f"The WACZ completed, but content packaging failed: {exc}"
+            if payload.get("automation_request"):
+                raise JobExecutionError(result["content_error"], result=result) from exc
+    update_progress(2, 2, result.get("status") or "Finished")
     if str(result.get("status") or "").startswith("failed"):
         raise JobExecutionError(str(result.get("error") or "Browsertrix archive failed."), result=result)
     return result
+
+
+def enqueue_profile_review(request_data: dict[str, Any]) -> dict[str, Any]:
+    """Validate and queue one automation-friendly profile review job."""
+    platform = str(request_data.get("platform") or "").casefold().strip()
+    if platform not in {"facebook", "instagram", "x"}:
+        raise ValueError("platform must be one of: facebook, instagram, x.")
+    profile = str(request_data.get("profile") or "").strip()
+    if not profile:
+        raise ValueError("profile is required.")
+
+    lookback = request_data.get("lookback") or {}
+    if not isinstance(lookback, dict):
+        raise ValueError("lookback must be an object with value and unit fields.")
+    raw_value = lookback.get("value")
+    try:
+        value = int(str(raw_value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("lookback.value must be a whole number from 1 through 520.") from exc
+    if not 1 <= value <= 520:
+        raise ValueError("lookback.value must be a whole number from 1 through 520.")
+    unit = str(lookback.get("unit") or "").casefold().strip()
+    if unit in {"day", "days"}:
+        days = value
+        normalized_unit = "days"
+    elif unit in {"week", "weeks"}:
+        days = value * 7
+        normalized_unit = "weeks"
+    else:
+        raise ValueError("lookback.unit must be days or weeks.")
+
+    end_date = parse_date(request_data.get("end_date") or date.today().isoformat(), "end_date")
+    start_date = end_date - timedelta(days=days - 1)
+    profile_filename = str(request_data.get("profile_filename") or "social-auth.tar.gz").strip()
+    profile_form = {"profile_filename": profile_filename}
+    profile_path = _profile_path(profile_form)
+    if not profile_path.is_file():
+        raise ValueError(f"Authenticated browser profile not found: {profile_path}")
+
+    if platform == "x":
+        batches = build_archive_plan(
+            facebook_urls=[],
+            instagram_urls=[],
+            x_accounts=[profile],
+            x_search_expressions=[],
+            x_additional_terms="-filter:replies",
+            x_start=start_date,
+            x_end=end_date,
+            batch_mode="single",
+        )
+        date_filter = "enforced"
+    else:
+        batches = build_archive_plan(
+            facebook_urls=[profile] if platform == "facebook" else [],
+            instagram_urls=[profile] if platform == "instagram" else [],
+            x_accounts=[],
+            x_search_expressions=[],
+            x_additional_terms="",
+            x_start=start_date,
+            x_end=end_date,
+            batch_mode="single",
+        )
+        batches = [
+            replace(batch, period_start=start_date.isoformat(), period_end=end_date.isoformat()) for batch in batches
+        ]
+        date_filter = "best_effort"
+
+    options = request_data.get("options") or {}
+    if not isinstance(options, dict):
+        raise ValueError("options must be an object when supplied.")
+    settings = CrawlSettings(
+        image=validate_image_name(str(options.get("browsertrix_image") or DEFAULT_IMAGE)),
+        behaviors=PROFILE_REVIEW_BEHAVIORS,
+        behavior_timeout_seconds=parse_int(options.get("behavior_timeout_seconds", 600), 600, 30, 7200),
+        time_limit_seconds=parse_int(options.get("time_limit_seconds", 1800), 1800, 60, 86400),
+        page_limit=parse_int(options.get("page_limit", 250), 250, 1, 5000),
+        size_limit_mb=parse_int(options.get("size_limit_mb", 2048), 2048, 100, 10240),
+        save_final_screenshot=False,
+        extract_final_text=True,
+        fail_on_content_check=get_form_bool(options, "fail_on_content_check", True),
+    )
+
+    batch = batches[0]
+    submission_id = "profile-review-" + uuid.uuid4().hex[:12]
+    run_id = slugify(f"{submission_id}-{batch.collection}", 120)
+    job_id = enqueue_job(
+        module_key=META["key"],
+        handler_key="social_media_archive.batch",
+        label=f"{platform.title()} profile review: {batch.label}",
+        group_id=submission_id,
+        payload={
+            "batch": asdict(batch),
+            "settings": asdict(settings),
+            "profile_filename": profile_filename,
+            "run_id": run_id,
+            "automation_request": {
+                "profile": profile,
+                "lookback": {"value": value, "unit": normalized_unit},
+                "requested_start": start_date.isoformat(),
+                "requested_end": end_date.isoformat(),
+                "date_filter": date_filter,
+            },
+        },
+    )
+    limitations = []
+    if date_filter == "best_effort":
+        limitations.append(
+            "Facebook and Instagram profile feeds do not provide a reliable date-bounded URL; the crawler scrolls the visible feed and the requested window is advisory."
+        )
+    limitations.append(
+        "Browser-derived text and graphics are best-effort and should be checked when complete; platform interface changes can affect collection."
+    )
+    return {
+        "submission_id": submission_id,
+        "job_id": job_id,
+        "status": "queued",
+        "platform": platform,
+        "profile": profile,
+        "requested_start": start_date.isoformat(),
+        "requested_end": end_date.isoformat(),
+        "date_filter": date_filter,
+        "limitations": limitations,
+    }
 
 
 def export_headers(form: dict[str, Any]) -> list[str]:

@@ -14,6 +14,7 @@ from urllib.parse import urlencode, urlparse
 
 DEFAULT_IMAGE = "webrecorder/browsertrix-crawler:1.14.1"
 DEFAULT_BEHAVIORS = "autoscroll,autoplay,autofetch,siteSpecific"
+PROFILE_REVIEW_BEHAVIORS = "autoscroll,autoplay,autofetch"
 SUPPORTED_PLATFORMS = {"facebook", "instagram", "x"}
 
 
@@ -32,6 +33,7 @@ class ArchiveBatch:
 @dataclass(frozen=True)
 class CrawlSettings:
     image: str = DEFAULT_IMAGE
+    behaviors: str = DEFAULT_BEHAVIORS
     behavior_timeout_seconds: int = 600
     time_limit_seconds: int = 1800
     page_limit: int = 250
@@ -262,6 +264,9 @@ def build_docker_command(
     container_name: str,
 ) -> list[str]:
     image = validate_image_name(settings.image)
+    behaviors = str(settings.behaviors or DEFAULT_BEHAVIORS).strip()
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:,[A-Za-z][A-Za-z0-9]*)*", behaviors):
+        raise ValueError("Browsertrix behaviors contain unsupported characters.")
     command = [
         docker_executable,
         "run",
@@ -284,7 +289,7 @@ def build_docker_command(
         "--workers",
         "1",
         "--behaviors",
-        DEFAULT_BEHAVIORS,
+        behaviors,
         "--alwaysAddBehaviorLinks",
         "--profile",
         "/profile/profile.tar.gz",
