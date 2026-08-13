@@ -1,3 +1,4 @@
+import os
 import unittest
 import json
 import tempfile
@@ -52,6 +53,19 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn('href="https://github.com/SaveOregonSchools/osint-tool/blob/main/LICENSE"', body)
         self.assertIn("Save Oregon Schools, LLC", body)
         self.assertNotIn("Preview row limit", body)
+
+    def test_toolbox_home_link_is_opt_in(self):
+        app.app.config.update(TESTING=True)
+
+        with patch.dict(os.environ, {"TOOLBOX_HOME_URL": ""}):
+            with app.app.test_client() as client:
+                body = client.get("/").get_data(as_text=True)
+        self.assertNotIn('class="button-link toolbox-link"', body)
+
+        with patch.dict(os.environ, {"TOOLBOX_HOME_URL": "/"}):
+            with app.app.test_client() as client:
+                body = client.get("/").get_data(as_text=True)
+        self.assertIn('class="button-link toolbox-link" href="/">All tools</a>', body)
 
     def test_query_page_runs_selected_module(self):
         app.app.config.update(TESTING=True)

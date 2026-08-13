@@ -207,6 +207,9 @@ export OSINT_DATA_ACCESS_MODE="official"
 # Required for the n8n social profile review API. Use a long random value.
 export OSINT_AUTOMATION_API_TOKEN="replace_with_a_long_random_token"
 
+# Optional parent launcher link shown in the application header
+export TOOLBOX_HOME_URL="/"
+
 # Google / YouTube
 export GOOGLE_CLOUD_PROJECT="your_google_cloud_project"
 export GOOGLE_APPLICATION_CREDENTIALS="C:\path\to\service-account.json"

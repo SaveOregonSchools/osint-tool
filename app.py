@@ -361,6 +361,7 @@ LAYOUT_START = """
     <h1>Social OSINT - Query Console</h1>
   </div>
   <div class="nav-links">
+    {% if toolbox_home_url %}<a class="button-link toolbox-link" href="{{ toolbox_home_url }}">All tools</a>{% endif %}
     <a class="button-link" href="{{ url_for('jobs_page') }}">Jobs</a>
     <a class="button-link" href="{{ url_for('resources') }}">Resources</a>
     <a class="brand-link" href="https://www.saveoregonschools.com" aria-label="Save Oregon Schools website">
@@ -623,6 +624,7 @@ def _template_context(**extra: Any) -> dict[str, Any]:
     ctx = {
         "css": BASE_CSS,
         "home_icon": HOME_ICON,
+        "toolbox_home_url": os.environ.get("TOOLBOX_HOME_URL", "").strip() or None,
         "year": datetime.now().year,
     }
     ctx.update(extra)
