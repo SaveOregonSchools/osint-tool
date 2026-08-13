@@ -98,6 +98,52 @@ Git. Jobs are run serially so multiple Browsertrix containers do not compete for
 the authenticated browser profile or workstation resources. You may leave the
 archive module, submit more work, or use other pages while the queue runs.
 
+## n8n Profile Review API
+
+Set a long random `OSINT_AUTOMATION_API_TOKEN` in the environment used to start
+the app. n8n must send it as `Authorization: Bearer <token>`.
+
+Submit one profile review with:
+
+```http
+POST /api/v1/social-profile-jobs
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "platform": "x",
+  "profile": "example_account",
+  "lookback": {"value": 6, "unit": "weeks"},
+  "profile_filename": "social-auth.tar.gz"
+}
+```
+
+The response is HTTP 202 and includes `job_id`, `status_url`, and `content_url`.
+Poll `GET <status_url>` with the same Bearer token until the status is
+`completed` or `failed`. Once completed, `GET <content_url>` returns extracted
+page text and a media manifest. Each media item has a token-protected
+`download_url` for the captured image file.
+
+These API submissions use the same persistent serial queue as jobs created in
+the browser UI. They force screenshots off and text extraction on. Optional
+limits can be supplied in an `options` object using the existing
+`behavior_timeout_seconds`, `time_limit_seconds`, `page_limit`, and
+`size_limit_mb` setting names.
+The workflow uses Browsertrix and the saved browser profile only. It does not
+read `X_BEARER_TOKEN`, call the X API, or incur X API request charges.
+Automation jobs use scrolling and media fetching without the regular archive
+module's social-site behavior, so they do not deliberately expand comment
+threads. Comments already visible in a platform feed may still appear in the
+extracted page text.
+
+For X, the requested lookback is enforced in the generated search using
+`since:` and `until:`. Facebook and Instagram profile URLs do not expose a
+reliable publication-date cutoff, so their requested window is advisory: the
+crawler scrolls the visible feed within its configured time/page limits, and a
+later processing step must apply any date information present in the content.
+Browsertrix page text is not guaranteed to be one record per post, and the
+image bundle can include avatars or interface images along with post graphics.
+
 ## Security and Collection Boundaries
 
 - Use an account dedicated to authorized archiving when possible.

@@ -1,5 +1,8 @@
+import gzip
+import json
 import tempfile
 import unittest
+import zipfile
 from datetime import date
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -15,6 +18,8 @@ from providers.browsertrix_archive import (
     inclusive_date_periods,
     normalize_x_handle,
 )
+from providers.wacz_content import extract_wacz_content
+import app as osint_app
 from queries import social_media_archive
 
 
@@ -163,6 +168,25 @@ class SocialMediaArchiveTests(unittest.TestCase):
         self.assertIn('id="archive-plan-results"', rendered)
         self.assertIn("scrollIntoView", rendered)
 
+    def test_result_links_include_the_deployment_url_prefix(self):
+        batch = ArchiveBatch(
+            batch_id="batch-0001",
+            platform="x",
+            label="example â€” 2024",
+            seed_url="https://x.com/search?q=from%3Aexample",
+            collection="x-example-2024",
+        )
+        result = social_media_archive._planned_result(batch, profile_exists=True)
+        form = {"qkey": "social_media_archive", "operation": "plan"}
+
+        with osint_app.app.test_request_context("/run", environ_overrides={"SCRIPT_NAME": "/osint"}):
+            rendered = social_media_archive.render_results(
+                form, social_media_archive.HEADERS, [social_media_archive._result_row(result)]
+            )
+
+        self.assertIn('href="/osint/jobs"', rendered)
+        self.assertIn('action="/osint/run"', rendered)
+
     def test_plan_with_missing_profile_does_not_offer_archive_action(self):
         batch = ArchiveBatch(
             batch_id="batch-0001",
@@ -208,6 +232,75 @@ class SocialMediaArchiveTests(unittest.TestCase):
         self.assertEqual(enqueue.call_count, 2)
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(str(row[headers.index("status")]).startswith("queued") for row in rows))
+
+    def test_automation_profile_review_queues_content_only_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module_dir = Path(tmp) / "social_media_archive"
+            profiles_dir = module_dir / "profiles"
+            profiles_dir.mkdir(parents=True)
+            (profiles_dir / "social-auth.tar.gz").write_bytes(b"profile")
+            with patch.object(social_media_archive, "MODULE_DATA_DIR", module_dir), patch.object(
+                social_media_archive, "PROFILES_DIR", profiles_dir
+            ), patch.object(social_media_archive, "enqueue_job", return_value="a" * 32) as enqueue:
+                result = social_media_archive.enqueue_profile_review(
+                    {
+                        "platform": "x",
+                        "profile": "example",
+                        "lookback": {"value": 2, "unit": "weeks"},
+                        "end_date": "2026-08-01",
+                    }
+                )
+
+        self.assertEqual(result["requested_start"], "2026-07-19")
+        self.assertEqual(result["requested_end"], "2026-08-01")
+        self.assertEqual(result["date_filter"], "enforced")
+        payload = enqueue.call_args.kwargs["payload"]
+        self.assertFalse(payload["settings"]["save_final_screenshot"])
+        self.assertTrue(payload["settings"]["extract_final_text"])
+        self.assertEqual(payload["settings"]["behaviors"], "autoscroll,autoplay,autofetch")
+        self.assertIn("since:2026-07-19 until:2026-08-02", payload["batch"]["query_text"])
+
+    def test_wacz_content_bundle_extracts_final_text_and_graphics(self):
+        def warc_record(record_type, target, content_type, block):
+            headers = (
+                "WARC/1.1\r\n"
+                f"WARC-Type: {record_type}\r\n"
+                f"WARC-Target-URI: {target}\r\n"
+                f"Content-Type: {content_type}\r\n"
+                f"Content-Length: {len(block)}\r\n\r\n"
+            ).encode("utf-8")
+            return headers + block + b"\r\n\r\n"
+
+        page_url = "https://x.com/example/status/123"
+        text_record = warc_record("resource", f"urn:textFinal:{page_url}", "text/plain", b"Final post text")
+        image_body = b"\x89PNG\r\n\x1a\n" + b"image-data"
+        http_block = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: "
+            + str(len(image_body)).encode("ascii")
+            + b"\r\n\r\n"
+            + image_body
+        )
+        image_record = warc_record("response", "https://pbs.twimg.com/media/test.png", "application/http", http_block)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wacz = root / "test.wacz"
+            with zipfile.ZipFile(wacz, "w") as archive:
+                archive.writestr(
+                    "pages/pages.jsonl",
+                    json.dumps({"format": "json-pages-1.0"})
+                    + "\n"
+                    + json.dumps({"url": page_url, "ts": "2026-08-01T12:00:00Z", "title": "Example"})
+                    + "\n",
+                )
+                archive.writestr("archive/data.warc.gz", gzip.compress(text_record + image_record))
+            details = extract_wacz_content(wacz, root / "content")
+            bundle = json.loads(Path(details["content_path"]).read_text(encoding="utf-8"))
+            media_path = root / "content" / bundle["media"][0]["file"]
+
+            self.assertEqual(bundle["documents"][0]["text"], "Final post text")
+            self.assertEqual(bundle["media_count"], 1)
+            self.assertEqual(media_path.read_bytes(), image_body)
 
 
 if __name__ == "__main__":

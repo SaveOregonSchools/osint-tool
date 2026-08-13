@@ -223,7 +223,18 @@ def list_jobs(limit: int = 250) -> list[dict[str, Any]]:
     init_job_queue()
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?", (max(1, min(limit, 2000)),)
+            """
+            SELECT * FROM jobs
+            ORDER BY
+                CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
+                CASE WHEN status IN ('running', 'queued') THEN created_at END ASC,
+                CASE WHEN status NOT IN ('running', 'queued')
+                     THEN COALESCE(NULLIF(completed_at, ''), created_at) END DESC,
+                CASE WHEN status IN ('running', 'queued') THEN rowid END ASC,
+                CASE WHEN status NOT IN ('running', 'queued') THEN rowid END DESC
+            LIMIT ?
+            """,
+            (max(1, min(limit, 2000)),),
         ).fetchall()
     jobs: list[dict[str, Any]] = []
     for row in rows:

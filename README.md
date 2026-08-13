@@ -48,6 +48,8 @@ The current integrations cover:
 - Exposes `/health` for a simple app/plugin smoke check.
 - Provides a persistent background-job queue and `/jobs` dashboard for
   long-running modules, including direct access to completed output folders.
+- Provides a Bearer-token-protected `/api/v1/social-profile-jobs` API for n8n
+  profile review submissions, status polling, and extracted text/image retrieval.
 - Exposes `/resources` for the evidence checklist and investigator tool links.
 
 The header includes the Save Oregon Schools logo linking to
@@ -201,6 +203,9 @@ export OSINT_DB_PATH="C:\Projects\osint-tool\data\osint_cache.db"
 
 # official, approved, or unofficial
 export OSINT_DATA_ACCESS_MODE="official"
+
+# Required for the n8n social profile review API. Use a long random value.
+export OSINT_AUTOMATION_API_TOKEN="replace_with_a_long_random_token"
 
 # Optional parent launcher link shown in the application header
 export TOOLBOX_HOME_URL="/"
