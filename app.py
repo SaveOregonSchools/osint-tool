@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from flask import Flask, Response, redirect, render_template_string, request, send_file, url_for
+from flask import Flask, Response, make_response, redirect, render_template_string, request, send_file, url_for
 from job_queue import get_job, list_jobs, queue_counts, start_worker
 from osint_common import enforce_source_access
 
@@ -790,8 +790,21 @@ JOBS_HTML = LAYOUT_START + """
   <span class="pill">Running: {{ counts.running }}</span>
   <span class="pill">Completed: {{ counts.completed }}</span>
   <span class="pill">Failed: {{ counts.failed }}</span>
-  {% if active %}<span class="subtle">This page refreshes every five seconds while work is active.</span>{% endif %}
+  {% if active and refresh_seconds %}
+    <span class="subtle">This page refreshes every {{ refresh_seconds }} seconds while work is active.</span>
+  {% elif active %}
+    <span class="subtle">Auto-refresh is off.</span>
+  {% else %}
+    <span class="subtle">Auto-refresh waits until work is active.</span>
+  {% endif %}
 </div>
+
+<form class="toolbar panel" method="get" action="{{ url_for('jobs_page') }}">
+  <label for="refresh" style="margin:0;">Auto-refresh interval:</label>
+  <input id="refresh" name="refresh" type="number" min="0" max="3600" step="1" value="{{ refresh_seconds }}" style="width:100px;">
+  <span class="subtle">seconds (0 turns it off)</span>
+  <button class="secondary" type="submit">Apply</button>
+</form>
 
 {% if jobs %}
 <div class="results" style="max-height:72vh;">
@@ -829,8 +842,22 @@ JOBS_HTML = LAYOUT_START + """
   <div class="panel"><p>No background jobs have been submitted yet.</p></div>
 {% endif %}
 
-{% if active %}<script>setTimeout(function () { window.location.reload(); }, 5000);</script>{% endif %}
+{% if active and refresh_seconds %}
+<script>setTimeout(function () { window.location.reload(); }, {{ refresh_seconds * 1000 }});</script>
+{% endif %}
 """ + LAYOUT_END
+
+
+DEFAULT_JOB_REFRESH_SECONDS = 15
+MAX_JOB_REFRESH_SECONDS = 3600
+
+
+def _job_refresh_seconds(value: Any) -> int:
+    try:
+        seconds = int(str(value))
+    except (TypeError, ValueError):
+        return DEFAULT_JOB_REFRESH_SECONDS
+    return max(0, min(seconds, MAX_JOB_REFRESH_SECONDS))
 
 
 @app.route("/jobs", methods=["GET"])
@@ -839,15 +866,30 @@ def jobs_page():
     start_worker()
     jobs = list_jobs()
     counts = queue_counts()
-    return render_template_string(
+    requested_refresh = request.args.get("refresh")
+    refresh_seconds = _job_refresh_seconds(
+        requested_refresh if requested_refresh is not None else request.cookies.get("jobs_refresh_seconds")
+    )
+    rendered = render_template_string(
         JOBS_HTML,
         **_template_context(
             title="Social OSINT - Background Jobs",
             jobs=jobs,
             counts=counts,
             active=bool(counts.get("queued") or counts.get("running")),
+            refresh_seconds=refresh_seconds,
         ),
     )
+    response = make_response(rendered)
+    if requested_refresh is not None:
+        response.set_cookie(
+            "jobs_refresh_seconds",
+            str(refresh_seconds),
+            max_age=365 * 24 * 60 * 60,
+            samesite="Lax",
+            path=request.script_root or "/",
+        )
+    return response
 
 
 @app.route("/jobs/<job_id>/open-folder", methods=["POST"])

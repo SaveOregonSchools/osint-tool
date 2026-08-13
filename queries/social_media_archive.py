@@ -7,6 +7,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
+from flask import has_request_context, url_for
+
 from common import get_form_bool, h, parse_int
 from job_queue import JobExecutionError, enqueue_job, register_job_handler
 from providers.browsertrix_archive import (
@@ -70,6 +72,13 @@ DISABLE_ROW_LIMIT = True
 BASE_DIR = Path(__file__).resolve().parents[1]
 MODULE_DATA_DIR = BASE_DIR / "data" / "social_media_archive"
 PROFILES_DIR = MODULE_DATA_DIR / "profiles"
+
+
+def _route_url(endpoint: str, fallback: str) -> str:
+    """Build a deployment-prefix-aware route URL when rendering in Flask."""
+    if has_request_context():
+        return url_for(endpoint)
+    return fallback
 
 
 def _lines(value: Any) -> list[str]:
@@ -517,8 +526,9 @@ def render_results(form: dict[str, Any], headers: list[str], rows: list[list[Any
     )
     archive_action = ""
     if can_run_archive:
+        run_url = _route_url("run", "/run")
         archive_action = f"""
-        <form method="post" action="/run" onsubmit="return showRunningMessage(event, this);" style="margin:12px 0 14px;">
+        <form method="post" action="{h(run_url)}" onsubmit="return showRunningMessage(event, this);" style="margin:12px 0 14px;">
           {_archive_submit_fields(form)}
           <button class="success" type="submit">Run Archiving</button>
         </form>
@@ -551,11 +561,12 @@ def render_results(form: dict[str, Any], headers: list[str], rows: list[list[Any
           });
         </script>
         """
+    jobs_url = _route_url("jobs_page", "/jobs")
     return f"""
     <div id="archive-plan-results">
     <div class="notice">
       <b>Archive result:</b> {h(summary)}.<br>
-      <span class="subtle">You may leave this page while queued jobs run. Follow progress and open output folders on the <a href="/jobs"><b>Jobs page</b></a>. Authenticated profile: <code>{h(profile_path)}</code>.</span>
+      <span class="subtle">You may leave this page while queued jobs run. Follow progress and open output folders on the <a href="{h(jobs_url)}"><b>Jobs page</b></a>. Authenticated profile: <code>{h(profile_path)}</code>.</span>
     </div>
     {archive_action}
     <div class="results"><table>

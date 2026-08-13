@@ -75,6 +75,33 @@ class JobQueueTests(unittest.TestCase):
         self.assertEqual(job["status"], "failed")
         self.assertIn("application stopped", job["error"])
 
+    def test_jobs_are_listed_in_execution_order_before_recent_history(self):
+        job_queue.init_job_queue()
+        records = [
+            ("completed-old", "completed", "2026-01-01T10:00:00+00:00", "2026-01-01T10:10:00+00:00"),
+            ("queued-second", "queued", "2026-01-01T10:03:00+00:00", ""),
+            ("running", "running", "2026-01-01T10:04:00+00:00", ""),
+            ("queued-first", "queued", "2026-01-01T10:02:00+00:00", ""),
+            ("completed-new", "completed", "2026-01-01T10:05:00+00:00", "2026-01-01T10:20:00+00:00"),
+        ]
+        with job_queue._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO jobs (
+                    id, group_id, module_key, handler_key, label, status,
+                    payload_json, created_at, completed_at
+                ) VALUES (?, 'group', 'test', 'test.none', ?, ?, '{}', ?, ?)
+                """,
+                [(job_id, job_id, status, created_at, completed_at) for job_id, status, created_at, completed_at in records],
+            )
+
+        jobs = job_queue.list_jobs()
+
+        self.assertEqual(
+            [job["id"] for job in jobs],
+            ["running", "queued-first", "queued-second", "completed-new", "completed-old"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

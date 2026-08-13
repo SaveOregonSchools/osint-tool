@@ -175,6 +175,37 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn("Background Jobs", body)
         self.assertIn("X: example", body)
         self.assertIn("Open output folder", body)
+        self.assertIn('name="refresh"', body)
+        self.assertIn('value="15"', body)
+
+    def test_jobs_page_refresh_interval_can_be_disabled_and_is_remembered(self):
+        app.app.config.update(TESTING=True)
+        counts = {"queued": 1, "running": 0, "completed": 0, "failed": 0}
+        with patch.object(app, "ensure_registry"), patch.object(app, "start_worker"), patch.object(
+            app, "list_jobs", return_value=[]
+        ), patch.object(app, "queue_counts", return_value=counts):
+            with app.app.test_client() as client:
+                disabled = client.get("/jobs?refresh=0")
+                remembered = client.get("/jobs")
+
+        disabled_body = disabled.get_data(as_text=True)
+        remembered_body = remembered.get_data(as_text=True)
+        self.assertIn("Auto-refresh is off.", disabled_body)
+        self.assertNotIn("window.location.reload", disabled_body)
+        self.assertIn('value="0"', remembered_body)
+
+    def test_jobs_page_refresh_interval_is_clamped_to_one_hour(self):
+        app.app.config.update(TESTING=True)
+        counts = {"queued": 1, "running": 0, "completed": 0, "failed": 0}
+        with patch.object(app, "ensure_registry"), patch.object(app, "start_worker"), patch.object(
+            app, "list_jobs", return_value=[]
+        ), patch.object(app, "queue_counts", return_value=counts):
+            with app.app.test_client() as client:
+                response = client.get("/jobs?refresh=9999")
+
+        body = response.get_data(as_text=True)
+        self.assertIn('value="3600"', body)
+        self.assertIn("window.location.reload(); }, 3600000", body)
 
     def test_job_output_folder_action_opens_only_project_data(self):
         output_dir = Path(app.__file__).resolve().parent / "data" / "social_media_archive" / "profiles"

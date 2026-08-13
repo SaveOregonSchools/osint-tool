@@ -19,6 +19,7 @@ from providers.browsertrix_archive import (
     normalize_x_handle,
 )
 from providers.wacz_content import extract_wacz_content
+import app as osint_app
 from queries import social_media_archive
 
 
@@ -166,6 +167,25 @@ class SocialMediaArchiveTests(unittest.TestCase):
         self.assertIn('name="x_accounts" value="example"', rendered)
         self.assertIn('id="archive-plan-results"', rendered)
         self.assertIn("scrollIntoView", rendered)
+
+    def test_result_links_include_the_deployment_url_prefix(self):
+        batch = ArchiveBatch(
+            batch_id="batch-0001",
+            platform="x",
+            label="example â€” 2024",
+            seed_url="https://x.com/search?q=from%3Aexample",
+            collection="x-example-2024",
+        )
+        result = social_media_archive._planned_result(batch, profile_exists=True)
+        form = {"qkey": "social_media_archive", "operation": "plan"}
+
+        with osint_app.app.test_request_context("/run", environ_overrides={"SCRIPT_NAME": "/osint"}):
+            rendered = social_media_archive.render_results(
+                form, social_media_archive.HEADERS, [social_media_archive._result_row(result)]
+            )
+
+        self.assertIn('href="/osint/jobs"', rendered)
+        self.assertIn('action="/osint/run"', rendered)
 
     def test_plan_with_missing_profile_does_not_offer_archive_action(self):
         batch = ArchiveBatch(
