@@ -21,6 +21,7 @@ from osint_common import enforce_source_access
 load_dotenv()
 
 app = Flask(__name__)
+DATA_ROOT = (Path(__file__).resolve().parent / "data").resolve()
 
 PLUGIN_PACKAGE = "queries"
 PLUGIN_DIR = Path(__file__).parent / PLUGIN_PACKAGE
@@ -123,10 +124,28 @@ def _job_content_path(job: dict[str, Any]) -> Path | None:
     if not value:
         return None
     target = Path(value).resolve()
-    data_root = (Path(__file__).resolve().parent / "data").resolve()
-    if not target.is_relative_to(data_root) or not target.is_file():
+    if not target.is_relative_to(DATA_ROOT) or not target.is_file():
         return None
     return target
+
+
+def _job_download_path(job: dict[str, Any]) -> Path | None:
+    """Return a completed job's primary downloadable artifact within data/."""
+    if job.get("status") != "completed":
+        return None
+    result = job.get("result") or {}
+    module_key = str(job.get("module_key") or "").strip()
+    for key in ("wacz_path", "artifact_path", "result_path", "output_path", "file_path", "content_path"):
+        value = str(result.get(key) or "").strip()
+        if not value:
+            continue
+        recorded = Path(value)
+        candidates = [recorded] if recorded.is_absolute() else [DATA_ROOT / module_key / recorded, DATA_ROOT / recorded]
+        for candidate in candidates:
+            target = candidate.resolve()
+            if target.is_relative_to(DATA_ROOT) and target.is_file():
+                return target
+    return None
 
 
 def csv_row(values: list[Any] | tuple[Any, ...]) -> str:
@@ -811,7 +830,7 @@ JOBS_HTML = LAYOUT_START + """
 {% if jobs %}
 <div class="results" style="max-height:72vh;">
   <table>
-    <thead><tr><th>Submitted</th><th>Module</th><th>Job</th><th>Status</th><th>Progress</th><th>Output</th><th>Details</th></tr></thead>
+    <thead><tr><th>Submitted</th><th>Module</th><th>Job</th><th>Status</th><th>Progress</th><th>Output</th><th>Results</th><th>Source</th></tr></thead>
     <tbody>
     {% for job in jobs %}
       <tr>
@@ -824,15 +843,12 @@ JOBS_HTML = LAYOUT_START + """
           {% if job.result.get('status') %}<b>{{ job.result.get('status') }}</b><br>{% endif %}
           {% if job.result.get('wacz_path') %}<code>{{ job.result.get('wacz_path') }}</code><br>{% endif %}
           {% if job.result.get('wacz_bytes') %}<span class="subtle">{{ job.result.get('wacz_bytes') }} bytes</span><br>{% endif %}
-          {% if job.result.get('sha256') %}<span class="subtle">SHA-256: {{ job.result.get('sha256') }}</span><br>{% endif %}
-          {% if job.result.get('output_dir') %}
-            <form method="post" action="{{ url_for('open_job_folder', job_id=job.id) }}" style="margin-top:6px;">
-              <button class="secondary" type="submit">Open output folder</button>
-            </form>
-          {% endif %}
+        </td>
+        <td>
+          {% if job.status == 'completed' %}<a href="{{ url_for('download_job_result', job_id=job.id) }}">Download</a>{% endif %}
         </td>
         <td class="wrap">
-          {% if job.result.get('target_url') %}<a href="{{ job.result.get('target_url') }}" target="_blank" rel="noreferrer">Open target</a><br>{% endif %}
+          {% if job.result.get('target_url') %}<a href="{{ job.result.get('target_url') }}" target="_blank" rel="noreferrer">View source</a><br>{% endif %}
           {% if job.error %}<span class="err" style="display:block;margin-top:5px;">{{ job.error }}</span>{% endif %}
         </td>
       </tr>
@@ -894,21 +910,17 @@ def jobs_page():
     return response
 
 
-@app.route("/jobs/<job_id>/open-folder", methods=["POST"])
-def open_job_folder(job_id: str):
-    ensure_registry()
+@app.route("/jobs/<job_id>/download", methods=["GET"])
+def download_job_result(job_id: str):
     job = get_job(job_id)
     if not job:
         return "Unknown job.", 404
-    output_dir = str((job.get("result") or {}).get("output_dir") or "")
-    if not output_dir:
-        return "This job does not have an output folder yet.", 400
-    target = Path(output_dir).resolve()
-    data_root = (Path(__file__).resolve().parent / "data").resolve()
-    if not target.is_relative_to(data_root) or not target.is_dir():
-        return "The recorded output folder is unavailable or outside the project data directory.", 400
-    os.startfile(str(target))
-    return redirect(url_for("jobs_page"))
+    if job.get("status") != "completed":
+        return "This job has not completed.", 409
+    target = _job_download_path(job)
+    if target is None:
+        return "This job does not have an available downloadable result.", 404
+    return send_file(target, as_attachment=True, download_name=target.name)
 
 
 @app.route("/query/<qkey>", methods=["GET"])
