@@ -173,7 +173,12 @@ class AppSmokeTests(unittest.TestCase):
             "message": "Completed",
             "created_at": "2026-07-30T12:00:00+00:00",
             "error": "",
-            "result": {"wacz_path": "runs/example/example.wacz", "output_dir": "C:\\example"},
+            "result": {
+                "wacz_path": "runs/example/example.wacz",
+                "wacz_bytes": 1234,
+                "sha256": "not-for-the-jobs-page",
+                "target_url": "https://example.com/source",
+            },
         }
         app.app.config.update(TESTING=True)
         with patch.object(app, "ensure_registry"), patch.object(app, "start_worker"), patch.object(
@@ -188,7 +193,14 @@ class AppSmokeTests(unittest.TestCase):
         body = response.get_data(as_text=True)
         self.assertIn("Background Jobs", body)
         self.assertIn("X: example", body)
-        self.assertIn("Open output folder", body)
+        self.assertIn("<th>Results</th><th>Source</th>", body)
+        self.assertIn(">Download</a>", body)
+        self.assertIn(">View source</a>", body)
+        self.assertNotIn("SHA-256", body)
+        self.assertNotIn("not-for-the-jobs-page", body)
+        self.assertNotIn("Open output folder", body)
+        self.assertNotIn("Open target", body)
+        self.assertNotIn("<th>Details</th>", body)
         self.assertIn('name="refresh"', body)
         self.assertIn('value="15"', body)
 
@@ -221,31 +233,55 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn('value="3600"', body)
         self.assertIn("window.location.reload(); }, 3600000", body)
 
-    def test_job_output_folder_action_opens_only_project_data(self):
-        output_dir = Path(app.__file__).resolve().parent / "data" / "social_media_archive" / "profiles"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        fake_job = {"result": {"output_dir": str(output_dir)}}
+    def test_completed_job_result_download_serves_wacz_from_module_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp)
+            wacz_path = data_root / "social_media_archive" / "runs" / "example.wacz"
+            wacz_path.parent.mkdir(parents=True)
+            wacz_path.write_bytes(b"wacz-result")
+            fake_job = {
+                "status": "completed",
+                "module_key": "social_media_archive",
+                "result": {"wacz_path": "runs/example.wacz"},
+            }
+            app.app.config.update(TESTING=True)
+            with patch.object(app, "DATA_ROOT", data_root), patch.object(app, "get_job", return_value=fake_job):
+                with app.app.test_client() as client:
+                    response = client.get("/jobs/example/download")
+                    response_data = response.get_data()
+                    content_disposition = response.headers["Content-Disposition"]
+                    response.close()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response_data, b"wacz-result")
+        self.assertIn("attachment; filename=example.wacz", content_disposition)
+
+    def test_job_result_download_requires_completed_status(self):
+        fake_job = {"status": "running", "module_key": "social_media_archive", "result": {}}
         app.app.config.update(TESTING=True)
-        with patch.object(app, "ensure_registry"), patch.object(app, "get_job", return_value=fake_job), patch.object(
-            app.os, "startfile", create=True
-        ) as startfile:
+        with patch.object(app, "get_job", return_value=fake_job):
             with app.app.test_client() as client:
-                response = client.post("/jobs/example/open-folder")
+                response = client.get("/jobs/example/download")
 
-        self.assertEqual(response.status_code, 302)
-        startfile.assert_called_once_with(str(output_dir.resolve()))
+        self.assertEqual(response.status_code, 409)
 
-    def test_job_output_folder_action_rejects_outside_path(self):
-        fake_job = {"result": {"output_dir": str(Path(app.__file__).resolve().parent.parent)}}
-        app.app.config.update(TESTING=True)
-        with patch.object(app, "ensure_registry"), patch.object(app, "get_job", return_value=fake_job), patch.object(
-            app.os, "startfile", create=True
-        ) as startfile:
-            with app.app.test_client() as client:
-                response = client.post("/jobs/example/open-folder")
+    def test_job_result_download_rejects_files_outside_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "data"
+            data_root.mkdir()
+            outside = Path(tmp) / "outside.wacz"
+            outside.write_bytes(b"private")
+            fake_job = {
+                "status": "completed",
+                "module_key": "social_media_archive",
+                "result": {"wacz_path": str(outside)},
+            }
+            app.app.config.update(TESTING=True)
+            with patch.object(app, "DATA_ROOT", data_root), patch.object(app, "get_job", return_value=fake_job):
+                with app.app.test_client() as client:
+                    response = client.get("/jobs/example/download")
 
-        self.assertEqual(response.status_code, 400)
-        startfile.assert_not_called()
+        self.assertEqual(response.status_code, 404)
 
     def test_health_endpoint_reports_loaded_plugins(self):
         app.app.config.update(TESTING=True)
