@@ -6,6 +6,9 @@ import json
 import mimetypes
 import re
 import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator
 from urllib.parse import urlparse
@@ -21,6 +24,35 @@ IMAGE_EXTENSIONS = {
     "image/svg+xml": ".svg",
     "image/webp": ".webp",
 }
+
+
+@dataclass(frozen=True)
+class XCaptureInspection:
+    classification: str
+    search_successes: int
+    search_rate_limits: int
+    search_other_statuses: int
+    rate_limit_remaining: int | None
+    rate_limit_reset: int | None
+    error_shell: bool
+    detail: str
+    authentication_state: str = "unknown"
+    authenticated_requests: int = 0
+    guest_requests: int = 0
+    logged_in_ui: bool = False
+    login_ui: bool = False
+
+    @property
+    def is_valid(self) -> bool:
+        return self.classification == "valid"
+
+    @property
+    def is_partial(self) -> bool:
+        return self.classification in {"rate_limited_partial", "invalid_partial"}
+
+    @property
+    def is_retryable(self) -> bool:
+        return self.classification in {"rate_limited_empty", "rate_limited_shell"}
 
 
 def _warc_records(stream: BinaryIO) -> Iterator[tuple[dict[str, str], bytes]]:
@@ -106,6 +138,235 @@ def _page_entries(archive: zipfile.ZipFile) -> dict[str, dict[str, Any]]:
                 if url:
                     pages[url] = item
     return pages
+
+
+def _http_status(block: bytes) -> int | None:
+    first_line = block.splitlines()[0] if block else b""
+    match = re.match(rb"HTTP/\S+\s+(\d{3})(?:\s|$)", first_line)
+    return int(match.group(1)) if match else None
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _retry_after_epoch(value: str, now_epoch: int) -> int | None:
+    text = str(value or "").strip()
+    seconds = _positive_int(text)
+    if seconds is not None:
+        return now_epoch + seconds
+    if not text:
+        return None
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0, int(parsed.timestamp()))
+
+
+def _cookie_names(value: str) -> set[str]:
+    names: set[str] = set()
+    for part in str(value or "").split(";"):
+        name, separator, _cookie_value = part.strip().partition("=")
+        if separator and name:
+            names.add(name.casefold())
+    return names
+
+
+def _is_x_request(target: str) -> bool:
+    host = (urlparse(target).hostname or "").casefold()
+    return host in {"x.com", "www.x.com", "twitter.com", "www.twitter.com", "api.x.com"} or host.endswith(
+        (".x.com", ".twitter.com")
+    )
+
+
+def inspect_x_wacz(wacz_path: Path, *, now_epoch: int | None = None) -> XCaptureInspection:
+    """Classify an X search capture using its archived SearchTimeline traffic."""
+    current_epoch = int(datetime.now(timezone.utc).timestamp()) if now_epoch is None else int(now_epoch)
+    successes = 0
+    rate_limits = 0
+    other_statuses = 0
+    reset_values: list[int] = []
+    retry_after_values: list[int] = []
+    remaining_by_reset: dict[int, list[int]] = {}
+    unpaired_remaining: list[int] = []
+    error_shell = False
+    authenticated_requests = 0
+    guest_requests = 0
+    logged_in_ui = False
+    login_ui = False
+
+    with zipfile.ZipFile(wacz_path) as archive:
+        for page in _page_entries(archive).values():
+            page_url = str(page.get("url") or "").casefold()
+            page_text = " ".join(str(page.get("text") or "").casefold().split())
+            if "x.com/" in page_url or "twitter.com/" in page_url:
+                nav_indicators = sum(
+                    indicator in page_text
+                    for indicator in ("notifications", "messages", "chat", "bookmarks", "communities", "profile")
+                )
+                if nav_indicators >= 3:
+                    logged_in_ui = True
+                if "/i/flow/login" in page_url or (
+                    nav_indicators < 3
+                    and re.search(r"(?:^|\s)(?:log in|sign in)(?:\s|$)", page_text)
+                    and re.search(r"(?:^|\s)(?:sign up|create account|join today)(?:\s|$)", page_text)
+                ):
+                    login_ui = True
+            if "x.com/search" in page_url and (
+                "something went wrong. try reloading." in page_text or "rate limit exceeded" in page_text
+            ):
+                error_shell = True
+
+        warc_names = [
+            name
+            for name in archive.namelist()
+            if name.startswith("archive/") and (name.endswith(".warc") or name.endswith(".warc.gz"))
+        ]
+        for warc_name in warc_names:
+            with archive.open(warc_name) as raw_warc:
+                stream: BinaryIO = gzip.GzipFile(fileobj=raw_warc) if warc_name.endswith(".gz") else raw_warc
+                for headers, block in _warc_records(stream):
+                    record_type = headers.get("warc-type", "").casefold()
+                    target = headers.get("warc-target-uri", "")
+                    if record_type == "request" and _is_x_request(target):
+                        request_headers, _request_body = _http_payload(block)
+                        cookie_names = _cookie_names(request_headers.get("cookie", ""))
+                        has_guest_token = bool(request_headers.get("x-guest-token"))
+                        if has_guest_token:
+                            guest_requests += 1
+                        if (
+                            request_headers.get("x-twitter-auth-type", "").casefold() == "oauth2session"
+                            and request_headers.get("x-twitter-active-user", "").casefold() == "yes"
+                            and bool(request_headers.get("x-csrf-token"))
+                            and {"auth_token", "ct0"}.issubset(cookie_names)
+                            and not has_guest_token
+                        ):
+                            authenticated_requests += 1
+                        continue
+                    if record_type not in {"response", "revisit"}:
+                        continue
+                    if not re.search(r"/SearchTimeline(?:\?|$)", target, flags=re.I):
+                        continue
+                    status = _http_status(block)
+                    http_headers, body = _http_payload(block)
+                    remaining = _positive_int(http_headers.get("x-rate-limit-remaining"))
+                    reset = _positive_int(http_headers.get("x-rate-limit-reset"))
+                    retry_after = _retry_after_epoch(http_headers.get("retry-after", ""), current_epoch)
+                    if remaining is not None:
+                        if reset is None:
+                            unpaired_remaining.append(remaining)
+                        else:
+                            remaining_by_reset.setdefault(reset, []).append(remaining)
+                    if reset is not None:
+                        reset_values.append(reset)
+                    if retry_after is not None:
+                        retry_after_values.append(retry_after)
+                    if status == 200:
+                        if record_type == "revisit" and not body:
+                            # A revisit only proves that some earlier payload was deduplicated.
+                            # The original response, when present in the WACZ, is validated separately.
+                            continue
+                        body_text = body.decode("utf-8", errors="replace")
+                        if "rate limit exceeded" in body_text.casefold():
+                            rate_limits += 1
+                            continue
+                        try:
+                            payload = json.loads(body_text)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            other_statuses += 1
+                            continue
+                        errors = payload.get("errors") if isinstance(payload, dict) else None
+                        if errors:
+                            error_text = json.dumps(errors, ensure_ascii=False).casefold()
+                            if "rate limit" in error_text or re.search(r'"code"\s*:\s*(?:88|429)\b', error_text):
+                                rate_limits += 1
+                            else:
+                                other_statuses += 1
+                            continue
+                        timeline = payload
+                        for key in ("data", "search_by_raw_query", "search_timeline", "timeline"):
+                            timeline = timeline.get(key) if isinstance(timeline, dict) else None
+                        if isinstance(timeline, dict):
+                            successes += 1
+                        else:
+                            other_statuses += 1
+                    elif status in {403, 429, 503}:
+                        body_text = body.decode("utf-8", errors="replace").casefold()
+                        if status in {429, 503} or remaining == 0 or "rate limit" in body_text:
+                            rate_limits += 1
+                        else:
+                            other_statuses += 1
+                    else:
+                        other_statuses += 1
+
+    latest_header_reset = max(reset_values) if reset_values else None
+    if latest_header_reset is not None and remaining_by_reset.get(latest_header_reset):
+        remaining = min(remaining_by_reset[latest_header_reset])
+    else:
+        remaining = min(unpaired_remaining) if unpaired_remaining else None
+    all_reset_values = reset_values + retry_after_values
+    reset = max(all_reset_values) if all_reset_values else None
+    if login_ui and not logged_in_ui:
+        authentication_state = "logged_out"
+    elif authenticated_requests and (logged_in_ui or successes or rate_limits):
+        authentication_state = "authenticated"
+    elif authenticated_requests:
+        authentication_state = "request_only"
+    else:
+        authentication_state = "unknown"
+
+    if authentication_state == "logged_out" and not successes:
+        classification = "authentication_failed"
+        detail = "The X capture reached a login page instead of authenticated search content."
+    elif rate_limits or (error_shell and successes):
+        classification = "rate_limited_partial" if successes else "rate_limited_empty"
+        detail = (
+            f"X SearchTimeline returned rate-limit/error content after {successes} successful response(s)."
+            if successes
+            else "X SearchTimeline was rate limited before any search response completed."
+        )
+    elif error_shell:
+        classification = "rate_limited_shell"
+        detail = "X returned its transient 'Something went wrong' search shell without usable timeline data."
+    elif other_statuses:
+        if successes:
+            classification = "invalid_partial"
+            detail = (
+                f"X SearchTimeline returned {successes} usable response(s) and "
+                f"{other_statuses} failed or malformed response(s); the capture may be partial."
+            )
+        else:
+            classification = "invalid"
+            detail = "The WACZ contains X SearchTimeline traffic, but no response had a usable timeline payload."
+    elif successes:
+        classification = "valid"
+        detail = f"Validated {successes} successful X SearchTimeline response(s)."
+    else:
+        classification = "invalid"
+        detail = "The X archive contains no SearchTimeline response, so capture completeness cannot be verified."
+
+    return XCaptureInspection(
+        classification=classification,
+        search_successes=successes,
+        search_rate_limits=rate_limits,
+        search_other_statuses=other_statuses,
+        rate_limit_remaining=remaining,
+        rate_limit_reset=reset,
+        error_shell=error_shell,
+        detail=detail,
+        authentication_state=authentication_state,
+        authenticated_requests=authenticated_requests,
+        guest_requests=guest_requests,
+        logged_in_ui=logged_in_ui,
+        login_ui=login_ui,
+    )
 
 
 def extract_wacz_content(wacz_path: Path, output_dir: Path) -> dict[str, Any]:

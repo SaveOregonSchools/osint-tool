@@ -204,6 +204,45 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn('name="refresh"', body)
         self.assertIn('value="15"', body)
 
+    def test_jobs_page_shows_x_reauthentication_recovery_command(self):
+        fake_job = {
+            "id": "abc12345deadbeef",
+            "group_id": "archive-group",
+            "module_key": "social_media_archive",
+            "label": "X: example — 2024",
+            "status": "failed",
+            "progress_current": 2,
+            "progress_total": 2,
+            "message": "X reauthentication required",
+            "created_at": "2026-08-25T12:00:00+00:00",
+            "error": "The saved X session is logged out.",
+            "result": {
+                "status": "failed — X reauthentication required",
+                "x_session_state": "logged_out",
+                "profile_refresh_status": "not_saved",
+                "reauthentication_required": True,
+                "reauthentication_profile_filename": "social-auth-reauth.tar.gz",
+                "reauthentication_command": "docker run create-login-profile --profile old --filename new",
+                "ssh_tunnel_command": "ssh -N -L 9223:127.0.0.1:9223 user@brad",
+            },
+        }
+        app.app.config.update(TESTING=True)
+        with patch.object(app, "ensure_registry"), patch.object(app, "start_worker"), patch.object(
+            app, "list_jobs", return_value=[fake_job]
+        ), patch.object(
+            app, "queue_counts", return_value={"queued": 0, "running": 0, "completed": 0, "failed": 1}
+        ):
+            with app.app.test_client() as client:
+                response = client.get("/jobs")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_data(as_text=True)
+        self.assertIn("X session: <b>logged_out</b>", body)
+        self.assertIn("Reauthenticate X", body)
+        self.assertIn("social-auth-reauth.tar.gz", body)
+        self.assertIn("create-login-profile --profile old --filename new", body)
+        self.assertIn("9223:127.0.0.1:9223", body)
+
     def test_jobs_page_refresh_interval_can_be_disabled_and_is_remembered(self):
         app.app.config.update(TESTING=True)
         counts = {"queued": 1, "running": 0, "completed": 0, "failed": 0}
