@@ -340,13 +340,19 @@ def validate_image_name(image: str) -> str:
     return value
 
 
-def validate_x_rate_limit_image(image: str) -> str:
+def browsertrix_image_version(image: str) -> tuple[int, int, int] | None:
     value = validate_image_name(image)
     tagged_reference = value.split("@", 1)[0]
     match = re.search(r":v?(\d+)\.(\d+)\.(\d+)(?:[-+][A-Za-z0-9._-]+)?$", tagged_reference)
-    if match is not None and tuple(int(part) for part in match.groups()) < (1, 14, 0):
+    return tuple(int(part) for part in match.groups()) if match is not None else None
+
+
+def validate_x_image(image: str) -> str:
+    value = validate_image_name(image)
+    version = browsertrix_image_version(value)
+    if version is not None and version < (1, 13, 2):
         raise ValueError(
-            "X archiving requires a Browsertrix image tagged 1.14.0 or newer so rate-limit detection is available."
+            "X archiving requires a Browsertrix image tagged 1.13.2 or newer."
         )
     return value
 
@@ -361,9 +367,16 @@ def build_docker_command(
     container_name: str,
 ) -> list[str]:
     image = (
-        validate_x_rate_limit_image(settings.image)
+        validate_x_image(settings.image)
         if batch.platform == "x"
         else validate_image_name(settings.image)
+    )
+    image_version = browsertrix_image_version(image)
+    supports_rate_limit_options = image_version is None or image_version >= (1, 14, 0)
+    behavior_links_option = (
+        "--ignoreScopeForBehaviorLinks"
+        if image_version is not None and image_version < (1, 14, 0)
+        else "--alwaysAddBehaviorLinks"
     )
     behaviors = str(settings.behaviors or DEFAULT_BEHAVIORS).strip()
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:,[A-Za-z][A-Za-z0-9]*)*", behaviors):
@@ -391,7 +404,7 @@ def build_docker_command(
         "1",
         "--behaviors",
         behaviors,
-        "--alwaysAddBehaviorLinks",
+        behavior_links_option,
         "--profile",
         "/profile/profile.tar.gz",
         "--behaviorTimeout",
@@ -410,10 +423,10 @@ def build_docker_command(
     if settings.fail_on_content_check:
         command.append("--failOnContentCheck")
     if batch.platform == "x":
+        command.extend(["--postLoadDelay", str(settings.x_post_load_delay_seconds)])
+    if batch.platform == "x" and supports_rate_limit_options:
         command.extend(
             [
-                "--postLoadDelay",
-                str(settings.x_post_load_delay_seconds),
                 "--rateLimitOnMatch",
                 r"Something went wrong\. Try reloading\.",
                 "--rateLimitOnMatch",
@@ -598,7 +611,7 @@ def build_x_auth_preflight_command(
         f"{profile_path.resolve()}:/profile/profile.tar.gz:ro",
         "-v",
         f"{behavior_path.resolve()}:/behaviors/x_auth_preflight.js:ro",
-        validate_x_rate_limit_image(image),
+        validate_x_image(image),
         "crawl",
         "--url",
         X_AUTH_PREFLIGHT_URL,
@@ -835,7 +848,7 @@ def preflight_x_authentication(
     """Verify X in a real browser, refresh a valid profile, and fail closed otherwise."""
     normalized_expected = normalize_x_handle(expected_handle) if str(expected_handle or "").strip() else ""
     fingerprint = _profile_fingerprint(profile_path)
-    cache_key = (*fingerprint, validate_x_rate_limit_image(image), normalized_expected.casefold())
+    cache_key = (*fingerprint, validate_x_image(image), normalized_expected.casefold())
     now = time.monotonic()
     with _X_AUTH_CACHE_LOCK:
         cached = _X_AUTH_CACHE.get(cache_key)
@@ -877,7 +890,7 @@ def preflight_x_authentication(
     )
 
     final_fingerprint = _profile_fingerprint(profile_path)
-    final_key = (*final_fingerprint, validate_x_rate_limit_image(image), normalized_expected.casefold())
+    final_key = (*final_fingerprint, validate_x_image(image), normalized_expected.casefold())
     if result.state == "indeterminate":
         expires_at = now + X_AUTH_INDETERMINATE_CACHE_SECONDS
     else:

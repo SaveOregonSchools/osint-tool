@@ -147,7 +147,7 @@ class SocialMediaArchiveTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "OSINT_X_POST_LOAD_DELAY_SECONDS"):
                 CrawlSettings()
 
-    def test_x_rate_limit_flags_reject_explicitly_old_images_but_allow_digest_pins(self):
+    def test_x_1_13_2_command_uses_compatible_flags_without_rate_limit_options(self):
         x_batch = ArchiveBatch(
             batch_id="batch-0001",
             platform="x",
@@ -157,13 +157,40 @@ class SocialMediaArchiveTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with self.assertRaisesRegex(ValueError, "1.14.0 or newer"):
+            command = build_docker_command(
+                docker_executable="docker",
+                run_dir=root / "run",
+                profile_path=root / "profile.tar.gz",
+                batch=x_batch,
+                settings=CrawlSettings(image="webrecorder/browsertrix-crawler:1.13.2"),
+                container_name="compat-image",
+            )
+
+        self.assertIn("--ignoreScopeForBehaviorLinks", command)
+        self.assertNotIn("--alwaysAddBehaviorLinks", command)
+        self.assertEqual(command[command.index("--postLoadDelay") + 1], "10")
+        self.assertNotIn("--rateLimitOnMatch", command)
+        self.assertNotIn("--rateLimitMaxRetries", command)
+        self.assertNotIn("--rateLimitInterruptCount", command)
+        self.assertNotIn("--rateLimitTimeout", command)
+
+    def test_x_images_older_than_1_13_2_are_rejected_but_digest_pins_are_allowed(self):
+        x_batch = ArchiveBatch(
+            batch_id="batch-0001",
+            platform="x",
+            label="example",
+            seed_url="https://x.com/search?q=from%3Aexample",
+            collection="x-example",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(ValueError, "1.13.2 or newer"):
                 build_docker_command(
                     docker_executable="docker",
                     run_dir=root / "run",
                     profile_path=root / "profile.tar.gz",
                     batch=x_batch,
-                    settings=CrawlSettings(image="webrecorder/browsertrix-crawler:1.13.3"),
+                    settings=CrawlSettings(image="webrecorder/browsertrix-crawler:1.13.1"),
                     container_name="old-image",
                 )
             command = build_docker_command(
@@ -200,6 +227,8 @@ class SocialMediaArchiveTests(unittest.TestCase):
 
         self.assertNotIn("--rateLimitOnMatch", command)
         self.assertNotIn("--postLoadDelay", command)
+        self.assertIn("--ignoreScopeForBehaviorLinks", command)
+        self.assertNotIn("--alwaysAddBehaviorLinks", command)
 
     def test_x_auth_preflight_command_is_one_page_temporary_and_profile_read_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -228,6 +257,22 @@ class SocialMediaArchiveTests(unittest.TestCase):
         behavior_mount = next(value for value in command if value.endswith(":/behaviors/x_auth_preflight.js:ro"))
         self.assertTrue(profile_mount)
         self.assertTrue(behavior_mount)
+
+    def test_x_1_13_2_auth_preflight_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = build_x_auth_preflight_command(
+                docker_executable="docker",
+                work_dir=root / "preflight",
+                profile_path=root / "profiles" / "social-auth-1.13.2.tar.gz",
+                image="webrecorder/browsertrix-crawler:1.13.2",
+                behavior_path=root / "x_auth_preflight.js",
+                container_name="x-auth-compat-test",
+            )
+
+        self.assertIn("webrecorder/browsertrix-crawler:1.13.2", command)
+        self.assertIn("--postLoadDelay", command)
+        self.assertNotIn("--rateLimitOnMatch", command)
 
     def test_interactive_profile_reopen_command_is_loopback_only_and_stages_new_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1331,7 +1376,7 @@ class SocialMediaArchiveTests(unittest.TestCase):
             "x_end": "2024-12-31",
             "batch_mode": "year",
             "profile_filename": "test-profile.tar.gz",
-            "browsertrix_image": "webrecorder/browsertrix-crawler:1.13.3",
+            "browsertrix_image": "webrecorder/browsertrix-crawler:1.13.1",
         }
         with tempfile.TemporaryDirectory() as tmp:
             module_dir = Path(tmp) / "social_media_archive"
@@ -1341,7 +1386,7 @@ class SocialMediaArchiveTests(unittest.TestCase):
             with patch.object(social_media_archive, "MODULE_DATA_DIR", module_dir), patch.object(
                 social_media_archive, "PROFILES_DIR", profiles_dir
             ), patch.object(social_media_archive, "enqueue_job") as enqueue:
-                with self.assertRaisesRegex(ValueError, "1.14.0 or newer"):
+                with self.assertRaisesRegex(ValueError, "1.13.2 or newer"):
                     social_media_archive.run(form)
 
         enqueue.assert_not_called()

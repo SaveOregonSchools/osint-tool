@@ -25,7 +25,7 @@ from providers.browsertrix_archive import (
     parse_date,
     slugify,
     validate_image_name,
-    validate_x_rate_limit_image,
+    validate_x_image,
 )
 from providers.wacz_content import extract_wacz_content
 
@@ -244,7 +244,7 @@ def render_fields(form: dict[str, Any]) -> str:
       </div>
       <div class="row" style="grid-column:1/-1;">
         <label>X crawler tuning</label>
-        <div class="subtle">{x_crawl_settings_summary} Set these in <code>.env</code> and restart the application after changing them. Their effective values are saved with each queued job.</div>
+        <div class="subtle">{x_crawl_settings_summary} The retry and interrupt controls apply to Browsertrix 1.14 or newer; the post-load delay also applies to the 1.13.2 compatibility path. Set them in <code>.env</code> and restart the application after changing them. Their effective values are saved with each queued job.</div>
       </div>
 
       <div class="row"><label>Behavior time per page (seconds)</label><input type="number" name="behavior_timeout_seconds" min="30" max="7200" value="{h(form.get('behavior_timeout_seconds', '600'))}"></div>
@@ -377,7 +377,7 @@ def run(form: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
         raise RuntimeError(f"Authenticated browser profile not found: {profile_path}")
     settings = _settings(form)
     if any(batch.platform == "x" for batch in batches):
-        validate_x_rate_limit_image(settings.image)
+        validate_x_image(settings.image)
     submission_id = "archive-" + uuid.uuid4().hex[:12]
     results: list[ArchiveResult] = []
     for batch in batches:
@@ -599,7 +599,7 @@ def enqueue_profile_review(request_data: dict[str, Any]) -> dict[str, Any]:
         ),
     )
     if platform == "x":
-        validate_x_rate_limit_image(settings.image)
+        validate_x_image(settings.image)
 
     batch = batches[0]
     submission_id = "profile-review-" + uuid.uuid4().hex[:12]

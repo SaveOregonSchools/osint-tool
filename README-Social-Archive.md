@@ -35,9 +35,10 @@ required.
    ```
 
    Browsertrix recommends using a published version rather than `latest` for
-   production work. Enter that same tagged image name in the module. X capture
-   requires Browsertrix 1.14.0 or newer because the queue relies on its
-   rate-limit detection and exit status.
+   production work. Enter that same tagged image name in the module. Browsertrix
+   1.14.3 is the default for X capture. Version 1.13.2 is also supported as a
+   compatibility option for diagnosing the false page-rate-limit behavior seen
+   with some 1.14 crawls; older tagged releases are rejected.
 
 3. Open the module and expand **Show local profile-creation instructions**.
 4. Run the displayed host-appropriate command, then open
@@ -79,14 +80,15 @@ OSINT_X_RATE_LIMIT_INTERRUPT_COUNT=-1
 OSINT_X_POST_LOAD_DELAY_SECONDS=10
 ```
 
-The defaults allow four Browsertrix retries, disable the immediate
-rate-limit-count interrupt, and wait 10 seconds after the search page loads
-before running behaviors. The accepted ranges are `-1` through `20` retries,
-`-1` through `1000` matches before interruption, and `0` through `600` seconds
-of post-load delay. Restart the application after changing `.env`. The
-effective values are copied into each queued job, its crawl plan, and its
-manifest, so jobs already in the queue keep the configuration with which they
-were submitted.
+For Browsertrix 1.14 or newer, the defaults allow four retries and disable the
+immediate rate-limit-count interrupt. The application omits those unsupported
+rate-limit options when using the 1.13.2 compatibility path. Both paths wait 10
+seconds after the search page loads before running behaviors. The accepted
+ranges are `-1` through `20` retries, `-1` through `1000` matches before
+interruption, and `0` through `600` seconds of post-load delay. Restart the
+application after changing `.env`. The effective values are copied into each
+queued job, its crawl plan, and its manifest, so jobs already in the queue keep
+the configuration with which they were submitted.
 
 ## X Authentication Preflight
 
