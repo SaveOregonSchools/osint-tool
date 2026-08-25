@@ -22,15 +22,31 @@ from urllib.parse import urlencode, urlparse
 from providers.wacz_content import XCaptureInspection, inspect_x_wacz
 
 
-DEFAULT_IMAGE = "webrecorder/browsertrix-crawler:1.14.1"
+DEFAULT_IMAGE = "webrecorder/browsertrix-crawler:1.14.3"
 DEFAULT_BEHAVIORS = "autoscroll,autoplay,autofetch,siteSpecific"
 PROFILE_REVIEW_BEHAVIORS = "autoscroll,autoplay,autofetch"
 SUPPORTED_PLATFORMS = {"facebook", "instagram", "x"}
+X_RATE_LIMIT_MAX_RETRIES_ENV = "OSINT_X_RATE_LIMIT_MAX_RETRIES"
+X_RATE_LIMIT_INTERRUPT_COUNT_ENV = "OSINT_X_RATE_LIMIT_INTERRUPT_COUNT"
+X_POST_LOAD_DELAY_SECONDS_ENV = "OSINT_X_POST_LOAD_DELAY_SECONDS"
 X_AUTH_PREFLIGHT_URL = "https://x.com/settings/account"
 X_AUTH_PREFLIGHT_BEHAVIOR = Path(__file__).resolve().parent / "behaviors" / "x_auth_preflight.js"
 X_AUTH_INDETERMINATE_CACHE_SECONDS = 5 * 60
 X_PROFILE_MAX_MEMBERS = 100_000
 X_PROFILE_MAX_EXPANDED_BYTES = 16 * 1024 * 1024 * 1024
+
+
+def _environment_integer(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = int(raw_value.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer between {minimum} and {maximum}.") from exc
+    if value < minimum or value > maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}.")
+    return value
 
 
 @dataclass(frozen=True)
@@ -58,6 +74,15 @@ class CrawlSettings:
     fail_on_content_check: bool = True
     retain_working_files: bool = False
     expected_x_session_handle: str = ""
+    x_rate_limit_max_retries: int = field(
+        default_factory=lambda: _environment_integer(X_RATE_LIMIT_MAX_RETRIES_ENV, 4, -1, 20)
+    )
+    x_rate_limit_interrupt_count: int = field(
+        default_factory=lambda: _environment_integer(X_RATE_LIMIT_INTERRUPT_COUNT_ENV, -1, -1, 1000)
+    )
+    x_post_load_delay_seconds: int = field(
+        default_factory=lambda: _environment_integer(X_POST_LOAD_DELAY_SECONDS_ENV, 10, 0, 600)
+    )
 
 
 @dataclass
@@ -387,14 +412,16 @@ def build_docker_command(
     if batch.platform == "x":
         command.extend(
             [
+                "--postLoadDelay",
+                str(settings.x_post_load_delay_seconds),
                 "--rateLimitOnMatch",
                 r"Something went wrong\. Try reloading\.",
                 "--rateLimitOnMatch",
                 "Rate limit exceeded",
                 "--rateLimitMaxRetries",
-                "0",
+                str(settings.x_rate_limit_max_retries),
                 "--rateLimitInterruptCount",
-                "1",
+                str(settings.x_rate_limit_interrupt_count),
                 "--rateLimitTimeout",
                 "900",
             ]

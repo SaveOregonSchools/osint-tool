@@ -91,11 +91,14 @@ class SocialMediaArchiveTests(unittest.TestCase):
             collection="x-example-2024",
         )
         settings = CrawlSettings(
-            image="webrecorder/browsertrix-crawler:1.14.1",
+            image="webrecorder/browsertrix-crawler:1.14.3",
             behavior_timeout_seconds=500,
             time_limit_seconds=1200,
             page_limit=125,
             size_limit_mb=512,
+            x_rate_limit_max_retries=4,
+            x_rate_limit_interrupt_count=-1,
+            x_post_load_delay_seconds=10,
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -108,19 +111,41 @@ class SocialMediaArchiveTests(unittest.TestCase):
                 container_name="osint-test",
             )
 
-        self.assertIn("webrecorder/browsertrix-crawler:1.14.1", command)
+        self.assertIn("webrecorder/browsertrix-crawler:1.14.3", command)
         self.assertIn("--alwaysAddBehaviorLinks", command)
         self.assertIn("--failOnContentCheck", command)
         self.assertIn("--rateLimitOnMatch", command)
         self.assertEqual(command.count("--rateLimitOnMatch"), 2)
-        self.assertEqual(command[command.index("--rateLimitInterruptCount") + 1], "1")
-        self.assertEqual(command[command.index("--rateLimitMaxRetries") + 1], "0")
+        self.assertEqual(command[command.index("--rateLimitInterruptCount") + 1], "-1")
+        self.assertEqual(command[command.index("--rateLimitMaxRetries") + 1], "4")
         self.assertEqual(command[command.index("--rateLimitTimeout") + 1], "900")
+        self.assertEqual(command[command.index("--postLoadDelay") + 1], "10")
         self.assertEqual(command[command.index("--pageLimit") + 1], "125")
         self.assertEqual(command[command.index("--timeLimit") + 1], "1200")
         self.assertEqual(command[command.index("--sizeLimit") + 1], str(512 * 1024 * 1024))
         profile_mount = command[command.index("-v", command.index("-v") + 1) + 1]
         self.assertTrue(profile_mount.endswith(":/profile/profile.tar.gz:ro"))
+
+    def test_x_crawl_tuning_defaults_are_loaded_from_environment(self):
+        environment = {
+            "OSINT_X_RATE_LIMIT_MAX_RETRIES": "7",
+            "OSINT_X_RATE_LIMIT_INTERRUPT_COUNT": "3",
+            "OSINT_X_POST_LOAD_DELAY_SECONDS": "15",
+        }
+        with patch.dict(browsertrix_archive.os.environ, environment):
+            settings = CrawlSettings()
+
+        self.assertEqual(settings.x_rate_limit_max_retries, 7)
+        self.assertEqual(settings.x_rate_limit_interrupt_count, 3)
+        self.assertEqual(settings.x_post_load_delay_seconds, 15)
+
+    def test_invalid_x_crawl_tuning_environment_is_rejected(self):
+        with patch.dict(
+            browsertrix_archive.os.environ,
+            {"OSINT_X_POST_LOAD_DELAY_SECONDS": "601"},
+        ):
+            with self.assertRaisesRegex(ValueError, "OSINT_X_POST_LOAD_DELAY_SECONDS"):
+                CrawlSettings()
 
     def test_x_rate_limit_flags_reject_explicitly_old_images_but_allow_digest_pins(self):
         x_batch = ArchiveBatch(
@@ -174,6 +199,7 @@ class SocialMediaArchiveTests(unittest.TestCase):
             )
 
         self.assertNotIn("--rateLimitOnMatch", command)
+        self.assertNotIn("--postLoadDelay", command)
 
     def test_x_auth_preflight_command_is_one_page_temporary_and_profile_read_only(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -143,6 +143,18 @@ def render_fields(form: dict[str, Any]) -> str:
     image = str(form.get("browsertrix_image") or DEFAULT_IMAGE)
     profile_filename = str(form.get("profile_filename") or "social-auth.tar.gz")
     try:
+        x_crawl_settings = CrawlSettings()
+        x_crawl_settings_summary = (
+            f"Current values: <code>OSINT_X_RATE_LIMIT_MAX_RETRIES="
+            f"{x_crawl_settings.x_rate_limit_max_retries}</code>, "
+            f"<code>OSINT_X_RATE_LIMIT_INTERRUPT_COUNT="
+            f"{x_crawl_settings.x_rate_limit_interrupt_count}</code>, and "
+            f"<code>OSINT_X_POST_LOAD_DELAY_SECONDS="
+            f"{x_crawl_settings.x_post_load_delay_seconds}</code>."
+        )
+    except ValueError as exc:
+        x_crawl_settings_summary = f"Invalid X crawler setting: {h(exc)}"
+    try:
         command_image = validate_image_name(image)
     except ValueError:
         command_image = DEFAULT_IMAGE
@@ -229,6 +241,10 @@ def render_fields(form: dict[str, Any]) -> str:
         <label>Browsertrix container image</label>
         <input type="text" name="browsertrix_image" value="{h(image)}">
         <div class="subtle">For repeatable evidence collection, replace <code>latest</code> with a tested release tag.</div>
+      </div>
+      <div class="row" style="grid-column:1/-1;">
+        <label>X crawler tuning</label>
+        <div class="subtle">{x_crawl_settings_summary} Set these in <code>.env</code> and restart the application after changing them. Their effective values are saved with each queued job.</div>
       </div>
 
       <div class="row"><label>Behavior time per page (seconds)</label><input type="number" name="behavior_timeout_seconds" min="30" max="7200" value="{h(form.get('behavior_timeout_seconds', '600'))}"></div>

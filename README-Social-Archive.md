@@ -68,6 +68,26 @@ ssh -N \
 Do not expose ports 6080 or 9223 publicly. They provide interactive access to
 the profile browser.
 
+## X Crawler Tuning
+
+The X-specific Browsertrix controls can be changed in `.env` without editing
+application code:
+
+```dotenv
+OSINT_X_RATE_LIMIT_MAX_RETRIES=4
+OSINT_X_RATE_LIMIT_INTERRUPT_COUNT=-1
+OSINT_X_POST_LOAD_DELAY_SECONDS=10
+```
+
+The defaults allow four Browsertrix retries, disable the immediate
+rate-limit-count interrupt, and wait 10 seconds after the search page loads
+before running behaviors. The accepted ranges are `-1` through `20` retries,
+`-1` through `1000` matches before interruption, and `0` through `600` seconds
+of post-load delay. Restart the application after changing `.env`. The
+effective values are copied into each queued job, its crawl plan, and its
+manifest, so jobs already in the queue keep the configuration with which they
+were submitted.
+
 ## X Authentication Preflight
 
 Every X capture begins with a small, temporary Browsertrix preflight crawl against
@@ -105,7 +125,7 @@ docker run --rm -it \
   -p 127.0.0.1:9223:9223 \
   -v /opt/osint-tool/data/social_media_archive/profiles:/crawls \
   -v /opt/osint-tool/data/social_media_archive/profiles/social-auth.tar.gz:/profile/old-profile.tar.gz:ro \
-  webrecorder/browsertrix-crawler:1.14.1 create-login-profile \
+  webrecorder/browsertrix-crawler:1.14.3 create-login-profile \
   --url https://x.com/settings/account \
   --filename /crawls/social-auth-reauth.tar.gz \
   --profile /profile/old-profile.tar.gz
