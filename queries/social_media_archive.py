@@ -1,27 +1,31 @@
 from __future__ import annotations
 
 import html
+import json
 import uuid
 from dataclasses import asdict, replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 from flask import has_request_context, url_for
 
 from common import get_form_bool, h, parse_int
-from job_queue import JobExecutionError, enqueue_job, register_job_handler
+from job_queue import JobExecutionError, JobRetry, enqueue_job, register_job_handler, set_job_throttle
 from providers.browsertrix_archive import (
     DEFAULT_IMAGE,
     PROFILE_REVIEW_BEHAVIORS,
     ArchiveBatch,
     ArchiveResult,
     CrawlSettings,
+    build_interactive_profile_command,
     build_archive_plan,
     execute_archive_plan,
+    normalize_x_handle,
     parse_date,
     slugify,
     validate_image_name,
+    validate_x_rate_limit_image,
 )
 from providers.wacz_content import extract_wacz_content
 
@@ -37,7 +41,7 @@ META = {
     "source_type": "manual_entry",
     "coverage": "Browser-assisted WACZ capture of user-supplied Facebook, Instagram, and X targets.",
     "limitations": [
-        "Requires Docker Desktop, a Browsertrix image, and a separately created authenticated browser profile.",
+        "Requires Docker Engine or Docker Desktop, a Browsertrix image, and a separately created authenticated browser profile.",
         "Does not bypass login, CAPTCHA, 2FA, access controls, rate limits, or platform restrictions.",
         "Year filtering applies to X search URLs. Facebook and Instagram do not expose equivalent feed date filters.",
         "Site interfaces and Browsertrix behaviors change; every WACZ should be replayed and quality-checked.",
@@ -62,6 +66,16 @@ HEADERS = [
     "error",
     "started_at",
     "completed_at",
+    "validation_status",
+    "search_successes",
+    "search_rate_limits",
+    "search_other_statuses",
+    "rate_limit_remaining",
+    "rate_limit_reset",
+    "partial",
+    "pruned_files",
+    "pruned_bytes",
+    "compaction_status",
 ]
 
 RUN_BUTTON_LABEL = "Preview or queue archive batches"
@@ -72,6 +86,12 @@ DISABLE_ROW_LIMIT = True
 BASE_DIR = Path(__file__).resolve().parents[1]
 MODULE_DATA_DIR = BASE_DIR / "data" / "social_media_archive"
 PROFILES_DIR = MODULE_DATA_DIR / "profiles"
+X_RATE_LIMIT_MAX_RETRIES = 3
+X_RATE_LIMIT_FALLBACK_SECONDS = 15 * 60
+X_RATE_LIMIT_GRACE_SECONDS = 15
+X_RATE_LIMIT_MAX_HEADER_WAIT_SECONDS = 60 * 60
+X_RATE_LIMIT_MAX_HEADER_AGE_SECONDS = 24 * 60 * 60
+BROWSERTRIX_RESOURCE_KEY = "social-media-archive:browsertrix"
 
 
 def _route_url(endpoint: str, fallback: str) -> str:
@@ -130,13 +150,12 @@ def render_fields(form: dict[str, Any]) -> str:
         command_profile_filename = _profile_filename(form)
     except ValueError:
         command_profile_filename = "social-auth.tar.gz"
-    profiles_dir = str(PROFILES_DIR.resolve())
-    profile_command = (
-        f'New-Item -ItemType Directory -Force -Path "{profiles_dir}"\n'
-        f'docker run --rm -it -p 6080:6080 -p 9223:9223 -v "{profiles_dir}:/crawls/profiles" '
-        f'{command_image} create-login-profile --url "https://www.facebook.com/" '
-        f'--filename "/crawls/profiles/{command_profile_filename}"'
+    profile_command = build_interactive_profile_command(
+        profiles_dir=PROFILES_DIR,
+        image=command_image,
+        output_filename=command_profile_filename,
     )
+    ssh_tunnel = "ssh -N -L 9223:127.0.0.1:9223 -L 6080:127.0.0.1:6080 <user>@<server>"
     return f"""
     <div class="notice">
       <b>Before the first archive:</b> create a dedicated Browsertrix profile, sign into only the accounts
@@ -145,9 +164,10 @@ def render_fields(form: dict[str, Any]) -> str:
       <details style="margin-top:8px;">
         <summary>Show local profile-creation instructions</summary>
         <ol>
-          <li>Install and start Docker Desktop.</li>
-          <li>Run the command below in PowerShell.</li>
-          <li>Open <a href="http://localhost:9223/" target="_blank" rel="noreferrer">http://localhost:9223/</a>, sign into Facebook, Instagram, and X in the embedded browser, then click <b>Create Profile</b>.</li>
+          <li>Install and start Docker Engine or Docker Desktop on the host where this app stores its data.</li>
+          <li>Run the command below in that host's shell. Both Browsertrix ports bind to loopback only.</li>
+          <li>For a remote Linux host, first tunnel the ports from your workstation with <code>{h(ssh_tunnel)}</code>.</li>
+          <li>Open <a href="http://127.0.0.1:9223/" target="_blank" rel="noreferrer">http://127.0.0.1:9223/</a>, sign into Facebook, Instagram, and X in the embedded browser, verify the X account, then click <b>Create Profile</b>.</li>
         </ol>
         <pre style="white-space:pre-wrap;overflow-wrap:anywhere;background:#f6f8fa;padding:10px;border-radius:6px;">{h(profile_command)}</pre>
       </details>
@@ -162,7 +182,12 @@ def render_fields(form: dict[str, Any]) -> str:
       <div class="row">
         <label>Authenticated profile filename</label>
         <input type="text" name="profile_filename" value="{h(profile_filename)}">
-        <div class="subtle">Read only from <code>data/social_media_archive/profiles/</code>.</div>
+        <div class="subtle">Stored under <code>data/social_media_archive/profiles/</code>. X preflight loads it read-only and atomically promotes a refreshed copy only after authentication is verified.</div>
+      </div>
+      <div class="row">
+        <label>Expected logged-in X account (optional)</label>
+        <input type="text" name="expected_x_session_handle" value="{h(form.get('expected_x_session_handle', ''))}" placeholder="your_crawler_account">
+        <div class="subtle">If set, X collection fails before capture when Browsertrix detects a different account or cannot verify the handle.</div>
       </div>
 
       <div class="row" style="grid-column:1/-1;">
@@ -213,6 +238,7 @@ def render_fields(form: dict[str, Any]) -> str:
       <div class="row"><label>Save final screenshot</label>{_select('save_final_screenshot', str(form.get('save_final_screenshot') or 'yes'), [('yes', 'Yes'), ('no', 'No')])}</div>
       <div class="row"><label>Extract final page text</label>{_select('extract_final_text', str(form.get('extract_final_text') or 'yes'), [('yes', 'Yes'), ('no', 'No')])}</div>
       <div class="row"><label>Fail when Browsertrix detects missing login/content</label>{_select('fail_on_content_check', str(form.get('fail_on_content_check') or 'yes'), [('yes', 'Yes'), ('no', 'No')])}</div>
+      <div class="row"><label>Retain Browsertrix working files</label>{_select('retain_working_files', str(form.get('retain_working_files') or 'no'), [('no', 'No — keep JSON and WACZ only'), ('yes', 'Yes — keep raw crawler workspace')])}<div class="subtle">The WACZ already contains the WARC, page records, indexes, and crawler log. The copied browser profile and external duplicates are removed by default after validation.</div></div>
     </div>
 
     <div class="limitations">
@@ -227,6 +253,8 @@ def render_fields(form: dict[str, Any]) -> str:
 
 
 def _settings(form: dict[str, Any]) -> CrawlSettings:
+    raw_expected_handle = str(form.get("expected_x_session_handle") or "").strip()
+    expected_handle = normalize_x_handle(raw_expected_handle) if raw_expected_handle else ""
     return CrawlSettings(
         image=_image(form),
         behavior_timeout_seconds=parse_int(form.get("behavior_timeout_seconds", 600), 600, 30, 7200),
@@ -236,6 +264,8 @@ def _settings(form: dict[str, Any]) -> CrawlSettings:
         save_final_screenshot=str(form.get("save_final_screenshot") or "yes") == "yes",
         extract_final_text=str(form.get("extract_final_text") or "yes") == "yes",
         fail_on_content_check=str(form.get("fail_on_content_check") or "yes") == "yes",
+        retain_working_files=str(form.get("retain_working_files") or "no") == "yes",
+        expected_x_session_handle=expected_handle,
     )
 
 
@@ -278,6 +308,44 @@ def _planned_result(batch: ArchiveBatch, profile_exists: bool) -> ArchiveResult:
     )
 
 
+def _x_throttle_key(profile_filename: str) -> str:
+    return f"social-media-archive:x:{profile_filename.casefold()}"
+
+
+def _x_retry_at(reset_epoch: int | None) -> str:
+    now = datetime.now(timezone.utc)
+    now_epoch = int(now.timestamp())
+    reset = int(reset_epoch or 0)
+    if not now_epoch - X_RATE_LIMIT_MAX_HEADER_AGE_SECONDS <= reset <= now_epoch + X_RATE_LIMIT_MAX_HEADER_WAIT_SECONDS:
+        reset = now_epoch + X_RATE_LIMIT_FALLBACK_SECONDS
+    retry_epoch = max(reset + X_RATE_LIMIT_GRACE_SECONDS, now_epoch + X_RATE_LIMIT_GRACE_SECONDS)
+    retry_at = datetime.fromtimestamp(retry_epoch, tz=timezone.utc)
+    return retry_at.isoformat(timespec="seconds")
+
+
+def _persist_attempt_manifest(run_dir: Path, result: dict[str, Any]) -> None:
+    """Link queue retries in the existing manifest without creating another sidecar file."""
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_results = payload.get("results")
+    if isinstance(manifest_results, list):
+        for manifest_result in manifest_results:
+            if isinstance(manifest_result, dict) and manifest_result.get("batch_id") == result.get("batch_id"):
+                manifest_result.update(result)
+                break
+    payload["job_attempt"] = {
+        "attempt_number": result.get("attempt_count"),
+        "previous_attempts": result.get("previous_attempts") or [],
+        "retry_at": result.get("retry_at") or "",
+    }
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    temporary = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(manifest_path)
+
+
 def run(form: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
     batches = build_plan(form)
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
@@ -292,6 +360,8 @@ def run(form: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
     if not profile_path.is_file():
         raise RuntimeError(f"Authenticated browser profile not found: {profile_path}")
     settings = _settings(form)
+    if any(batch.platform == "x" for batch in batches):
+        validate_x_rate_limit_image(settings.image)
     submission_id = "archive-" + uuid.uuid4().hex[:12]
     results: list[ArchiveResult] = []
     for batch in batches:
@@ -301,6 +371,8 @@ def run(form: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
             handler_key="social_media_archive.batch",
             label=f"{batch.platform.title()}: {batch.label}",
             group_id=submission_id,
+            throttle_key=_x_throttle_key(_profile_filename(form)) if batch.platform == "x" else "",
+            resource_key=BROWSERTRIX_RESOURCE_KEY,
             payload={
                 "batch": asdict(batch),
                 "settings": asdict(settings),
@@ -332,8 +404,20 @@ def run_queued_job(
     profile_filename = str(payload.get("profile_filename") or "")
     if Path(profile_filename).name != profile_filename or not profile_filename.casefold().endswith(".tar.gz"):
         raise JobExecutionError("Queued job contains an invalid browser profile filename.")
-    run_id = slugify(str(payload.get("run_id") or "archive-job"), 120)
-    update_progress(0, 2, "Running Browsertrix capture")
+    retry_count = max(0, int(payload.get("rate_limit_retry_count") or 0))
+    base_run_id = slugify(str(payload.get("run_id") or "archive-job"), 120)
+    if retry_count == 0:
+        run_id = base_run_id
+    else:
+        suffix = f"-attempt-{retry_count + 1}"
+        run_id = base_run_id[: 120 - len(suffix)].rstrip("-") + suffix
+    update_progress(
+        0,
+        2,
+        "Verifying the saved X session, then running Browsertrix capture"
+        if batch.platform == "x"
+        else "Running Browsertrix capture",
+    )
     run_dir, results = execute_archive_plan(
         batches=[batch],
         settings=settings,
@@ -343,9 +427,59 @@ def run_queued_job(
     )
     result = asdict(results[0])
     result["output_dir"] = str(run_dir.resolve())
+    result["attempt_count"] = retry_count + 1
+    result["previous_attempts"] = list(payload.get("previous_attempts") or [])
     if payload.get("automation_request"):
         result["automation_request"] = dict(payload["automation_request"])
-    if not str(result.get("status") or "").startswith("failed"):
+    status = str(result.get("status") or "")
+    if batch.platform == "x":
+        throttle_key = _x_throttle_key(profile_filename)
+        retry_at = _x_retry_at(result.get("rate_limit_reset"))
+        if result.get("validation_status") == "rate_limited_partial":
+            message = (
+                f"X rate-limited this batch after {result.get('search_successes') or 0} successful timeline "
+                f"response(s). It is partial and was not blindly rerun; split the date range before retrying."
+            )
+            set_job_throttle(throttle_key, retry_at, f"X rate limit active; next attempt after {retry_at}")
+            existing_error = str(result.get("error") or "")
+            result["error"] = message + (f" {existing_error}" if result.get("compaction_status") == "failed" else "")
+            _persist_attempt_manifest(run_dir, result)
+            raise JobExecutionError(message, result=result)
+        if status == "rate limited":
+            message = f"X rate limit active; retrying after {retry_at}"
+            set_job_throttle(throttle_key, retry_at, message)
+            if retry_count < X_RATE_LIMIT_MAX_RETRIES:
+                next_payload = dict(payload)
+                next_payload["rate_limit_retry_count"] = retry_count + 1
+                next_payload["previous_attempts"] = result["previous_attempts"] + [
+                    {
+                        "run_id": run_id,
+                        "status": status,
+                        "wacz_path": result.get("wacz_path") or "",
+                        "retry_at": retry_at,
+                    }
+                ]
+                result["status"] = "rate limited — retry scheduled"
+                result["retry_at"] = retry_at
+                _persist_attempt_manifest(run_dir, result)
+                raise JobRetry(
+                    message,
+                    retry_at=retry_at,
+                    payload=next_payload,
+                    result=result,
+                    throttle_key=throttle_key,
+                )
+            message = f"X remained rate limited after {retry_count + 1} attempts; last reset gate was {retry_at}."
+            result["error"] = message
+            _persist_attempt_manifest(run_dir, result)
+            raise JobExecutionError(message, result=result)
+        if status.startswith("completed") and result.get("rate_limit_remaining") == 0:
+            set_job_throttle(
+                throttle_key,
+                retry_at,
+                f"X SearchTimeline quota reached zero; next X batch waits until {retry_at}",
+            )
+    if payload.get("automation_request") and not status.startswith("failed"):
         wacz_value = str(result.get("wacz_path") or "")
         wacz_path = Path(wacz_value)
         if not wacz_path.is_absolute():
@@ -355,9 +489,10 @@ def run_queued_job(
             result.update(extract_wacz_content(wacz_path, run_dir / "content"))
         except Exception as exc:
             result["content_error"] = f"The WACZ completed, but content packaging failed: {exc}"
-            if payload.get("automation_request"):
-                raise JobExecutionError(result["content_error"], result=result) from exc
+            _persist_attempt_manifest(run_dir, result)
+            raise JobExecutionError(result["content_error"], result=result) from exc
     update_progress(2, 2, result.get("status") or "Finished")
+    _persist_attempt_manifest(run_dir, result)
     if str(result.get("status") or "").startswith("failed"):
         raise JobExecutionError(str(result.get("error") or "Browsertrix archive failed."), result=result)
     return result
@@ -441,7 +576,14 @@ def enqueue_profile_review(request_data: dict[str, Any]) -> dict[str, Any]:
         save_final_screenshot=False,
         extract_final_text=True,
         fail_on_content_check=get_form_bool(options, "fail_on_content_check", True),
+        expected_x_session_handle=(
+            normalize_x_handle(str(options.get("expected_x_session_handle") or request_data.get("expected_x_session_handle")))
+            if str(options.get("expected_x_session_handle") or request_data.get("expected_x_session_handle") or "").strip()
+            else ""
+        ),
     )
+    if platform == "x":
+        validate_x_rate_limit_image(settings.image)
 
     batch = batches[0]
     submission_id = "profile-review-" + uuid.uuid4().hex[:12]
@@ -451,6 +593,8 @@ def enqueue_profile_review(request_data: dict[str, Any]) -> dict[str, Any]:
         handler_key="social_media_archive.batch",
         label=f"{platform.title()} profile review: {batch.label}",
         group_id=submission_id,
+        throttle_key=_x_throttle_key(profile_filename) if platform == "x" else "",
+        resource_key=BROWSERTRIX_RESOURCE_KEY,
         payload={
             "batch": asdict(batch),
             "settings": asdict(settings),
@@ -514,7 +658,7 @@ def _archive_submit_fields(form: dict[str, Any]) -> str:
 def render_results(form: dict[str, Any], headers: list[str], rows: list[list[Any]]) -> str:
     status_index = headers.index("status")
     completed = sum(1 for row in rows if str(row[status_index]).startswith("completed"))
-    failed = sum(1 for row in rows if row[status_index] == "failed")
+    failed = sum(1 for row in rows if str(row[status_index]).startswith("failed"))
     queued = sum(1 for row in rows if str(row[status_index]).startswith("queued"))
     planned = len(rows) - completed - failed - queued
     summary = f"{queued} queued, {completed} completed, {failed} failed, {planned} planned"

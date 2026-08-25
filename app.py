@@ -843,6 +843,18 @@ JOBS_HTML = LAYOUT_START + """
           {% if job.result.get('status') %}<b>{{ job.result.get('status') }}</b><br>{% endif %}
           {% if job.result.get('wacz_path') %}<code>{{ job.result.get('wacz_path') }}</code><br>{% endif %}
           {% if job.result.get('wacz_bytes') %}<span class="subtle">{{ job.result.get('wacz_bytes') }} bytes</span><br>{% endif %}
+          {% if job.result.get('x_session_state') %}
+            <span class="subtle">X session: <b>{{ job.result.get('x_session_state') }}</b>{% if job.result.get('x_account_handle') %} as @{{ job.result.get('x_account_handle') }}{% endif %}{% if job.result.get('x_auth_cache_hit') %} (cached){% endif %}</span><br>
+          {% endif %}
+          {% if job.result.get('profile_refresh_status') %}<span class="subtle">Profile: {{ job.result.get('profile_refresh_status') }}</span><br>{% endif %}
+          {% if job.result.get('reauthentication_command') and job.result.get('x_session_state') not in ('verified', 'authenticated') %}
+            <details style="margin-top:6px;">
+              <summary>{% if job.result.get('reauthentication_required') %}Reauthenticate X{% else %}Repair or recheck the X profile{% endif %}</summary>
+              <div class="subtle">Run on the archive host. On a remote Linux server, run the SSH tunnel locally first, then open <code>http://127.0.0.1:9223/</code>. Complete X login/2FA, verify the account, click <b>Create Profile</b>, and rerun with <code>{{ job.result.get('reauthentication_profile_filename') }}</code>.</div>
+              <pre style="white-space:pre-wrap;overflow-wrap:anywhere;">{{ job.result.get('ssh_tunnel_command') }}</pre>
+              <pre style="white-space:pre-wrap;overflow-wrap:anywhere;">{{ job.result.get('reauthentication_command') }}</pre>
+            </details>
+          {% endif %}
         </td>
         <td>
           {% if job.status == 'completed' %}<a href="{{ url_for('download_job_result', job_id=job.id) }}">Download</a>{% endif %}
