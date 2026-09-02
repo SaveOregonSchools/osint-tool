@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import uuid
 from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 from flask import has_request_context, url_for
 
@@ -35,15 +37,15 @@ META = {
     "name": "Social Media Archive — Facebook, Instagram & X",
     "description": (
         "Create high-fidelity WACZ archives with Browsertrix using an authenticated browser profile. "
-        "Facebook and Instagram URLs are isolated into separate collections; X account/search captures "
-        "can be split into non-overlapping yearly collections."
+        "Facebook uses a timeline-only historical-post preset; X account/search captures use smaller "
+        "non-overlapping date batches and structured post exports."
     ),
     "source_type": "manual_entry",
     "coverage": "Browser-assisted WACZ capture of user-supplied Facebook, Instagram, and X targets.",
     "limitations": [
         "Requires Docker Engine or Docker Desktop, a Browsertrix image, and a separately created authenticated browser profile.",
         "Does not bypass login, CAPTCHA, 2FA, access controls, rate limits, or platform restrictions.",
-        "Year filtering applies to X search URLs. Facebook and Instagram do not expose equivalent feed date filters.",
+        "Date filtering applies to X search URLs. Facebook and Instagram do not expose equivalent feed date filters.",
         "Site interfaces and Browsertrix behaviors change; every WACZ should be replayed and quality-checked.",
         "Browser profiles and WACZ files may contain session tokens or personalized information and must be stored securely.",
     ],
@@ -76,6 +78,11 @@ HEADERS = [
     "pruned_files",
     "pruned_bytes",
     "compaction_status",
+    "content_path",
+    "post_count",
+    "oldest_post_at",
+    "newest_post_at",
+    "completeness_status",
 ]
 
 RUN_BUTTON_LABEL = "Preview or queue archive batches"
@@ -139,7 +146,7 @@ def _image(form: dict[str, Any]) -> str:
 def render_fields(form: dict[str, Any]) -> str:
     x_start, x_end = _default_dates(form)
     operation = str(form.get("operation") or "plan")
-    batch_mode = str(form.get("batch_mode") or "year")
+    batch_mode = str(form.get("batch_mode") or "quarter")
     image = str(form.get("browsertrix_image") or DEFAULT_IMAGE)
     profile_filename = str(form.get("profile_filename") or "social-auth.tar.gz")
     try:
@@ -203,8 +210,9 @@ def render_fields(form: dict[str, Any]) -> str:
       </div>
 
       <div class="row" style="grid-column:1/-1;">
-        <label>Facebook profile, Page, group, photo, reel, or post URLs — one per line</label>
+        <label>Facebook profile, Page, or group timeline URLs — one per line</label>
         <textarea name="facebook_urls" placeholder="https://www.facebook.com/example">{h(form.get('facebook_urls', ''))}</textarea>
+        <div class="subtle">The Historical posts preset stays on the timeline, expands post text, captures attached images, and skips comments, reels, photo grids, and video.</div>
       </div>
       <div class="row" style="grid-column:1/-1;">
         <label>Instagram profile, post, reel, story, or highlight URLs — one per line</label>
@@ -235,7 +243,7 @@ def render_fields(form: dict[str, Any]) -> str:
       </div>
       <div class="row">
         <label>X archive batching</label>
-        {_select('batch_mode', batch_mode, [('year', 'Separate WACZ collection per calendar year'), ('single', 'One WACZ collection for the full date range')])}
+        {_select('batch_mode', batch_mode, [('quarter', 'Quarterly — recommended'), ('month', 'Monthly — use for busy/rate-limited accounts'), ('year', 'Yearly — lower job count, higher rate-limit risk'), ('single', 'One WACZ for the full date range')])}
       </div>
       <div class="row">
         <label>Browsertrix container image</label>
@@ -247,11 +255,11 @@ def render_fields(form: dict[str, Any]) -> str:
         <div class="subtle">{x_crawl_settings_summary} The retry and interrupt controls apply to Browsertrix 1.14 or newer; the post-load delay also applies to the 1.13.2 compatibility path. Set them in <code>.env</code> and restart the application after changing them. Their effective values are saved with each queued job.</div>
       </div>
 
-      <div class="row"><label>Behavior time per page (seconds)</label><input type="number" name="behavior_timeout_seconds" min="30" max="7200" value="{h(form.get('behavior_timeout_seconds', '600'))}"></div>
-      <div class="row"><label>Maximum time per WACZ batch (seconds)</label><input type="number" name="time_limit_seconds" min="60" max="86400" value="{h(form.get('time_limit_seconds', '1800'))}"></div>
-      <div class="row"><label>Maximum pages per WACZ batch</label><input type="number" name="page_limit" min="1" max="5000" value="{h(form.get('page_limit', '250'))}"></div>
-      <div class="row"><label>Maximum WACZ batch size (MB)</label><input type="number" name="size_limit_mb" min="100" max="10240" value="{h(form.get('size_limit_mb', '2048'))}"></div>
-      <div class="row"><label>Save final screenshot</label>{_select('save_final_screenshot', str(form.get('save_final_screenshot') or 'yes'), [('yes', 'Yes'), ('no', 'No')])}</div>
+      <div class="row"><label>Behavior time per page (seconds)</label><input type="number" name="behavior_timeout_seconds" min="30" max="7200" value="{h(form.get('behavior_timeout_seconds', '900'))}"></div>
+      <div class="row"><label>Maximum time per WACZ batch (seconds)</label><input type="number" name="time_limit_seconds" min="60" max="86400" value="{h(form.get('time_limit_seconds', '1500'))}"></div>
+      <div class="row"><label>Maximum pages per WACZ batch</label><input type="number" name="page_limit" min="1" max="5000" value="{h(form.get('page_limit', '10'))}"></div>
+      <div class="row"><label>Maximum WACZ batch size (MB)</label><input type="number" name="size_limit_mb" min="100" max="10240" value="{h(form.get('size_limit_mb', '512'))}"></div>
+      <div class="row"><label>Save final screenshot</label>{_select('save_final_screenshot', str(form.get('save_final_screenshot') or 'no'), [('no', 'No — recommended'), ('yes', 'Yes')])}</div>
       <div class="row"><label>Extract final page text</label>{_select('extract_final_text', str(form.get('extract_final_text') or 'yes'), [('yes', 'Yes'), ('no', 'No')])}</div>
       <div class="row"><label>Fail when Browsertrix detects missing login/content</label>{_select('fail_on_content_check', str(form.get('fail_on_content_check') or 'yes'), [('yes', 'Yes'), ('no', 'No')])}</div>
       <div class="row"><label>Retain Browsertrix working files</label>{_select('retain_working_files', str(form.get('retain_working_files') or 'no'), [('no', 'No — keep JSON and WACZ only'), ('yes', 'Yes — keep raw crawler workspace')])}<div class="subtle">The WACZ already contains the WARC, page records, indexes, and crawler log. The copied browser profile and external duplicates are removed by default after validation.</div></div>
@@ -261,7 +269,7 @@ def render_fields(form: dict[str, Any]) -> str:
       <b>Batching boundary</b>
       <ul>
         <li>Every Facebook and Instagram URL is always written to its own collection.</li>
-        <li>X account/search captures are split by calendar year by default using <code>since:</code> and <code>until:</code>.</li>
+        <li>X account/search captures are split by calendar quarter by default using <code>since:</code> and <code>until:</code>; use monthly batches for busy accounts.</li>
         <li>Page, time, and size limits apply independently to every collection.</li>
       </ul>
     </div>
@@ -273,11 +281,11 @@ def _settings(form: dict[str, Any]) -> CrawlSettings:
     expected_handle = normalize_x_handle(raw_expected_handle) if raw_expected_handle else ""
     return CrawlSettings(
         image=_image(form),
-        behavior_timeout_seconds=parse_int(form.get("behavior_timeout_seconds", 600), 600, 30, 7200),
-        time_limit_seconds=parse_int(form.get("time_limit_seconds", 1800), 1800, 60, 86400),
-        page_limit=parse_int(form.get("page_limit", 250), 250, 1, 5000),
-        size_limit_mb=parse_int(form.get("size_limit_mb", 2048), 2048, 100, 10240),
-        save_final_screenshot=str(form.get("save_final_screenshot") or "yes") == "yes",
+        behavior_timeout_seconds=parse_int(form.get("behavior_timeout_seconds", 900), 900, 30, 7200),
+        time_limit_seconds=parse_int(form.get("time_limit_seconds", 1500), 1500, 60, 86400),
+        page_limit=parse_int(form.get("page_limit", 10), 10, 1, 5000),
+        size_limit_mb=parse_int(form.get("size_limit_mb", 512), 512, 100, 10240),
+        save_final_screenshot=str(form.get("save_final_screenshot") or "no") == "yes",
         extract_final_text=str(form.get("extract_final_text") or "yes") == "yes",
         fail_on_content_check=str(form.get("fail_on_content_check") or "yes") == "yes",
         retain_working_files=str(form.get("retain_working_files") or "no") == "yes",
@@ -302,7 +310,7 @@ def build_plan(form: dict[str, Any]) -> list[ArchiveBatch]:
         x_additional_terms=str(form.get("x_additional_terms") or ""),
         x_start=x_start,
         x_end=x_end,
-        batch_mode=str(form.get("batch_mode") or "year"),
+        batch_mode=str(form.get("batch_mode") or "quarter"),
     )
 
 
@@ -448,13 +456,48 @@ def run_queued_job(
     if payload.get("automation_request"):
         result["automation_request"] = dict(payload["automation_request"])
     status = str(result.get("status") or "")
+    wacz_value = str(result.get("wacz_path") or "")
+    if wacz_value:
+        wacz_path = Path(wacz_value)
+        if not wacz_path.is_absolute():
+            wacz_path = MODULE_DATA_DIR / wacz_path
+        if wacz_path.is_file() and result.get("validation_status") != "package_invalid":
+            update_progress(1, 2, "Extracting structured posts and attached images")
+            expected_handle_match = re.search(r"(?:^|\s)from:([A-Za-z0-9_]{1,15})(?:\s|$)", batch.query_text, re.I)
+            try:
+                result.update(
+                    extract_wacz_content(
+                        wacz_path,
+                        run_dir / "content",
+                        platform=batch.platform,
+                        expected_x_handle=expected_handle_match.group(1) if expected_handle_match else "",
+                        expected_facebook_slug=(
+                            next((part for part in urlparse(batch.seed_url).path.split("/") if part), "")
+                            if batch.platform == "facebook"
+                            else ""
+                        ),
+                        period_start=batch.period_start,
+                        period_end=batch.period_end,
+                        validation_status=str(result.get("validation_status") or ""),
+                    )
+                )
+            except Exception as exc:
+                result["content_error"] = f"The WACZ completed, but structured content packaging failed: {exc}"
+                _persist_attempt_manifest(run_dir, result)
+                if status.startswith("completed"):
+                    raise JobExecutionError(result["content_error"], result=result) from exc
     if batch.platform == "x":
         throttle_key = _x_throttle_key(profile_filename)
         retry_at = _x_retry_at(result.get("rate_limit_reset"))
         if result.get("validation_status") == "rate_limited_partial":
+            narrower = (
+                " Rerun only this affected period with Monthly batching."
+                if batch.period_granularity in {"quarter", "year", "single"}
+                else ""
+            )
             message = (
                 f"X rate-limited this batch after {result.get('search_successes') or 0} successful timeline "
-                f"response(s). It is partial and was not blindly rerun; split the date range before retrying."
+                f"response(s). It is partial and was not blindly rerun.{narrower}"
             )
             set_job_throttle(throttle_key, retry_at, f"X rate limit active; next attempt after {retry_at}")
             existing_error = str(result.get("error") or "")
@@ -495,18 +538,6 @@ def run_queued_job(
                 retry_at,
                 f"X SearchTimeline quota reached zero; next X batch waits until {retry_at}",
             )
-    if payload.get("automation_request") and not status.startswith("failed"):
-        wacz_value = str(result.get("wacz_path") or "")
-        wacz_path = Path(wacz_value)
-        if not wacz_path.is_absolute():
-            wacz_path = MODULE_DATA_DIR / wacz_path
-        update_progress(1, 2, "Packaging extracted text and graphics")
-        try:
-            result.update(extract_wacz_content(wacz_path, run_dir / "content"))
-        except Exception as exc:
-            result["content_error"] = f"The WACZ completed, but content packaging failed: {exc}"
-            _persist_attempt_manifest(run_dir, result)
-            raise JobExecutionError(result["content_error"], result=result) from exc
     update_progress(2, 2, result.get("status") or "Finished")
     _persist_attempt_manifest(run_dir, result)
     if str(result.get("status") or "").startswith("failed"):
@@ -585,10 +616,10 @@ def enqueue_profile_review(request_data: dict[str, Any]) -> dict[str, Any]:
     settings = CrawlSettings(
         image=validate_image_name(str(options.get("browsertrix_image") or DEFAULT_IMAGE)),
         behaviors=PROFILE_REVIEW_BEHAVIORS,
-        behavior_timeout_seconds=parse_int(options.get("behavior_timeout_seconds", 600), 600, 30, 7200),
-        time_limit_seconds=parse_int(options.get("time_limit_seconds", 1800), 1800, 60, 86400),
-        page_limit=parse_int(options.get("page_limit", 250), 250, 1, 5000),
-        size_limit_mb=parse_int(options.get("size_limit_mb", 2048), 2048, 100, 10240),
+        behavior_timeout_seconds=parse_int(options.get("behavior_timeout_seconds", 900), 900, 30, 7200),
+        time_limit_seconds=parse_int(options.get("time_limit_seconds", 1500), 1500, 60, 86400),
+        page_limit=parse_int(options.get("page_limit", 10), 10, 1, 5000),
+        size_limit_mb=parse_int(options.get("size_limit_mb", 512), 512, 100, 10240),
         save_final_screenshot=False,
         extract_final_text=True,
         fail_on_content_check=get_form_bool(options, "fail_on_content_check", True),

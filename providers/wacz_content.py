@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import gzip
 import hashlib
 import json
@@ -369,7 +370,288 @@ def inspect_x_wacz(wacz_path: Path, *, now_epoch: int | None = None) -> XCapture
     )
 
 
-def extract_wacz_content(wacz_path: Path, output_dir: Path) -> dict[str, Any]:
+def _json_payloads(body: bytes) -> Iterator[Any]:
+    text = body.decode("utf-8", errors="replace").strip()
+    if not text:
+        return
+    if text.startswith("for (;;);"):
+        text = text[len("for (;;);") :].lstrip()
+    try:
+        yield json.loads(text)
+        return
+    except json.JSONDecodeError:
+        pass
+    for line in text.splitlines():
+        candidate = line.strip()
+        if candidate.startswith("for (;;);"):
+            candidate = candidate[len("for (;;);") :].lstrip()
+        if not candidate:
+            continue
+        try:
+            yield json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+
+def _nested(value: Any, *keys: str) -> Any:
+    current = value
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _walk_dicts(value: Any) -> Iterator[dict[str, Any]]:
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            yield current
+            stack.extend(reversed(list(current.values())))
+        elif isinstance(current, list):
+            stack.extend(reversed(current))
+
+
+def _iso_post_date(value: Any) -> str:
+    if isinstance(value, (int, float)) or (isinstance(value, str) and value.isdigit()):
+        try:
+            return datetime.fromtimestamp(int(value), tz=timezone.utc).isoformat(timespec="seconds")
+        except (OverflowError, OSError, ValueError):
+            return ""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.strptime(text, "%a %b %d %H:%M:%S %z %Y")
+    except ValueError:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _media_key(url: str) -> str:
+    parsed = urlparse(str(url or ""))
+    host = (parsed.hostname or "").casefold()
+    path = parsed.path
+    if host == "pbs.twimg.com" and path.startswith("/media/"):
+        path = re.sub(r"\.(?:avif|gif|jpe?g|png|webp)$", "", path, flags=re.I)
+    return host + path
+
+
+def _x_user(result: dict[str, Any]) -> tuple[str, str]:
+    user = _nested(result, "core", "user_results", "result")
+    if not isinstance(user, dict):
+        return "", ""
+    legacy = user.get("legacy") if isinstance(user.get("legacy"), dict) else {}
+    core = user.get("core") if isinstance(user.get("core"), dict) else {}
+    handle = str(legacy.get("screen_name") or core.get("screen_name") or "").strip()
+    name = str(legacy.get("name") or core.get("name") or "").strip()
+    return handle, name
+
+
+def _unwrap_x_tweet(value: Any) -> dict[str, Any] | None:
+    result = value
+    for _index in range(4):
+        if not isinstance(result, dict):
+            return None
+        if isinstance(result.get("tweet"), dict):
+            result = result["tweet"]
+            continue
+        if not result.get("legacy") and isinstance(result.get("result"), dict):
+            result = result["result"]
+            continue
+        break
+    return result if isinstance(result, dict) and isinstance(result.get("legacy"), dict) else None
+
+
+def _x_post_from_item(item_content: dict[str, Any], source_url: str) -> dict[str, Any] | None:
+    result = _unwrap_x_tweet(_nested(item_content, "tweet_results", "result"))
+    if result is None:
+        return None
+    legacy = result["legacy"]
+    post_id = str(result.get("rest_id") or legacy.get("id_str") or "").strip()
+    if not post_id:
+        return None
+    handle, author_name = _x_user(result)
+    note = _nested(result, "note_tweet", "note_tweet_results", "result")
+    note_text = str(note.get("text") or "").strip() if isinstance(note, dict) else ""
+    text = note_text or str(legacy.get("full_text") or legacy.get("text") or "").strip()
+    media_items = _nested(legacy, "extended_entities", "media") or _nested(legacy, "entities", "media") or []
+    media: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    if isinstance(media_items, list):
+        for item in media_items:
+            if not isinstance(item, dict) or str(item.get("type") or "").casefold() != "photo":
+                continue
+            media_url = str(item.get("media_url_https") or item.get("media_url") or "").strip()
+            if media_url and media_url not in seen_urls:
+                seen_urls.add(media_url)
+                media.append({"type": "image", "source_url": media_url})
+    return {
+        "platform": "x",
+        "post_id": post_id,
+        "url": f"https://x.com/{handle}/status/{post_id}" if handle else f"https://x.com/i/status/{post_id}",
+        "account_handle": handle,
+        "author_name": author_name,
+        "published_at": _iso_post_date(legacy.get("created_at")),
+        "text": text,
+        "media": media,
+        "source_response": source_url.split("?", 1)[0],
+    }
+
+
+def _x_posts(payload: Any, source_url: str, expected_handle: str = "") -> Iterator[dict[str, Any]]:
+    for node in _walk_dicts(payload):
+        item_content = node.get("itemContent")
+        if not isinstance(item_content, dict) or not isinstance(item_content.get("tweet_results"), dict):
+            continue
+        post = _x_post_from_item(item_content, source_url)
+        if post is None:
+            continue
+        if expected_handle and str(post.get("account_handle") or "").casefold() != expected_handle.casefold():
+            continue
+        yield post
+
+
+def _facebook_message(node: dict[str, Any]) -> str:
+    message = node.get("message")
+    if isinstance(message, dict):
+        return str(message.get("text") or message.get("story") or "").strip()
+    return str(message or "").strip()
+
+
+def _facebook_url(node: dict[str, Any]) -> str:
+    for key in ("url", "wwwURL", "permalink_url", "story_url"):
+        value = str(node.get(key) or "").strip()
+        if value.startswith(("http://", "https://")) and (
+            "/posts/" in value or "story_fbid=" in value or "/permalink/" in value
+        ):
+            return value
+    return ""
+
+
+def _facebook_images(value: Any) -> list[dict[str, str]]:
+    urls: list[str] = []
+    for node in _walk_dicts(value):
+        typename = str(node.get("__typename") or "").casefold()
+        for key in ("uri", "url"):
+            candidate = str(node.get(key) or "").strip()
+            if not candidate.startswith(("http://", "https://")):
+                continue
+            parsed = urlparse(candidate)
+            description = (candidate + " " + typename).casefold()
+            if not (
+                (parsed.hostname or "").casefold().endswith("fbcdn.net")
+                or typename in {"image", "photo", "photomedia"}
+            ):
+                continue
+            if re.search(r"(?:emoji|profile|avatar|safe_image|static_map)", description):
+                continue
+            urls.append(candidate)
+    return [{"type": "image", "source_url": url} for url in dict.fromkeys(urls)]
+
+
+def _facebook_posts(payload: Any, source_url: str, expected_slug: str = "") -> Iterator[dict[str, Any]]:
+    for node in _walk_dicts(payload):
+        if str(node.get("__typename") or node.get("__isFeedUnit") or "") != "Story":
+            continue
+        post_id = str(node.get("post_id") or "").strip()
+        url = _facebook_url(node)
+        published_at = _iso_post_date(node.get("creation_time") or node.get("creation_timestamp"))
+        if not post_id or not (published_at or url):
+            continue
+        url_slug = next((part for part in urlparse(url).path.split("/") if part), "")
+        if expected_slug and url_slug.casefold() != expected_slug.casefold():
+            continue
+        related_nodes = [
+            descendant
+            for descendant in _walk_dicts(node)
+            if str(descendant.get("post_id") or "").strip() == post_id
+        ]
+        messages = [_facebook_message(descendant) for descendant in related_nodes]
+        text = max((message for message in messages if message), key=len, default="")
+        if not text:
+            continue
+        attachments = [
+            descendant.get("attachments") or descendant.get("attachment")
+            for descendant in related_nodes
+            if descendant.get("attachments") or descendant.get("attachment")
+        ]
+        actors = node.get("actors") if isinstance(node.get("actors"), list) else []
+        actor = actors[0] if actors and isinstance(actors[0], dict) else node.get("actor")
+        actor = actor if isinstance(actor, dict) else {}
+        yield {
+            "platform": "facebook",
+            "post_id": post_id,
+            "url": url,
+            "account_handle": "",
+            "author_name": str(actor.get("name") or "").strip(),
+            "published_at": published_at,
+            "text": text,
+            "media": _facebook_images(attachments),
+            "source_response": source_url.split("?", 1)[0],
+        }
+
+
+def _merge_post(posts: dict[str, dict[str, Any]], post: dict[str, Any]) -> None:
+    key = f"{post.get('platform')}:{post.get('post_id')}"
+    existing = posts.get(key)
+    if existing is None:
+        posts[key] = post
+        return
+    if len(str(post.get("text") or "")) > len(str(existing.get("text") or "")):
+        existing["text"] = post["text"]
+    for field in ("url", "account_handle", "author_name", "published_at"):
+        if not existing.get(field) and post.get(field):
+            existing[field] = post[field]
+    combined = list(existing.get("media") or []) + list(post.get("media") or [])
+    existing["media"] = list(
+        {str(item.get("source_url") or ""): item for item in combined if item.get("source_url")}.values()
+    )
+
+
+def _write_posts_csv(path: Path, posts: list[dict[str, Any]]) -> None:
+    fields = [
+        "platform",
+        "post_id",
+        "url",
+        "account_handle",
+        "author_name",
+        "published_at",
+        "text",
+        "image_count",
+        "image_files",
+    ]
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for post in posts:
+            media = list(post.get("media") or [])
+            writer.writerow(
+                {
+                    **{field: post.get(field, "") for field in fields[:-2]},
+                    "image_count": len(media),
+                    "image_files": " | ".join(str(item.get("file") or item.get("source_url") or "") for item in media),
+                }
+            )
+
+
+def extract_wacz_content(
+    wacz_path: Path,
+    output_dir: Path,
+    *,
+    platform: str = "",
+    expected_x_handle: str = "",
+    expected_facebook_slug: str = "",
+    period_start: str = "",
+    period_end: str = "",
+    validation_status: str = "",
+) -> dict[str, Any]:
     """Create an n8n-friendly text and image bundle from a Browsertrix WACZ."""
     output_dir.mkdir(parents=True, exist_ok=True)
     media_dir = output_dir / "media"
@@ -377,9 +659,7 @@ def extract_wacz_content(wacz_path: Path, output_dir: Path) -> dict[str, Any]:
 
     final_text: dict[str, str] = {}
     initial_text: dict[str, str] = {}
-    media: list[dict[str, Any]] = []
-    seen_media: set[str] = set()
-    total_media_bytes = 0
+    posts_by_key: dict[str, dict[str, Any]] = {}
 
     with zipfile.ZipFile(wacz_path) as archive:
         pages = _page_entries(archive)
@@ -410,27 +690,77 @@ def extract_wacz_content(wacz_path: Path, output_dir: Path) -> dict[str, Any]:
                         continue
                     http_headers, body = _http_payload(block)
                     content_type = http_headers.get("content-type", "").split(";", 1)[0].casefold().strip()
-                    if not content_type.startswith("image/") or not body:
+                    if not body or not (
+                        "json" in content_type
+                        or "/SearchTimeline" in target
+                        or ("facebook.com" in target and "/graphql" in target)
+                    ):
+                        continue
+                    for payload in _json_payloads(body):
+                        if platform == "x" or "/SearchTimeline" in target:
+                            for post in _x_posts(payload, target, expected_x_handle):
+                                _merge_post(posts_by_key, post)
+                        if platform == "facebook" and "facebook.com" in target:
+                            for post in _facebook_posts(payload, target, expected_facebook_slug):
+                                _merge_post(posts_by_key, post)
+
+        posts = sorted(
+            posts_by_key.values(),
+            key=lambda item: (str(item.get("published_at") or ""), str(item.get("post_id") or "")),
+        )
+        desired_media_keys = {
+            _media_key(str(item.get("source_url") or ""))
+            for post in posts
+            for item in list(post.get("media") or [])
+            if item.get("source_url")
+        }
+        focused_media = platform in {"facebook", "x"}
+        media: list[dict[str, Any]] = []
+        media_by_key: dict[str, dict[str, Any]] = {}
+        media_by_digest: dict[str, dict[str, Any]] = {}
+        total_media_bytes = 0
+        for warc_name in warc_names:
+            with archive.open(warc_name) as raw_warc:
+                stream = gzip.GzipFile(fileobj=raw_warc) if warc_name.endswith(".gz") else raw_warc
+                for headers, block in _warc_records(stream):
+                    target = headers.get("warc-target-uri", "")
+                    if headers.get("warc-type", "").casefold() != "response" or not target.startswith(
+                        ("http://", "https://")
+                    ):
+                        continue
+                    http_headers, body = _http_payload(block)
+                    content_type = http_headers.get("content-type", "").split(";", 1)[0].casefold().strip()
+                    key = _media_key(target)
+                    if not content_type.startswith("image/") or not body or (focused_media and key not in desired_media_keys):
                         continue
                     if len(body) > MAX_MEDIA_FILE_BYTES or total_media_bytes + len(body) > MAX_MEDIA_TOTAL_BYTES:
                         continue
                     digest = hashlib.sha256(body).hexdigest()
-                    if digest in seen_media:
+                    existing = media_by_digest.get(digest)
+                    if existing is not None:
+                        media_by_key[key] = existing
                         continue
-                    seen_media.add(digest)
                     filename = f"{len(media) + 1:04d}-{digest[:12]}{_extension(content_type, target)}"
                     destination = media_dir / filename
                     destination.write_bytes(body)
                     total_media_bytes += len(body)
-                    media.append(
-                        {
-                            "source_url": target,
-                            "content_type": content_type,
-                            "bytes": len(body),
-                            "sha256": digest,
-                            "file": f"media/{filename}",
-                        }
-                    )
+                    entry = {
+                        "source_url": target,
+                        "content_type": content_type,
+                        "bytes": len(body),
+                        "sha256": digest,
+                        "file": f"media/{filename}",
+                    }
+                    media.append(entry)
+                    media_by_key[key] = entry
+                    media_by_digest[digest] = entry
+
+        for post in posts:
+            linked_media: list[dict[str, Any]] = []
+            for item in list(post.get("media") or []):
+                captured = media_by_key.get(_media_key(str(item.get("source_url") or "")))
+                linked_media.append({**item, **({"file": captured["file"], "sha256": captured["sha256"]} if captured else {})})
+            post["media"] = linked_media
 
     document_urls = set(pages) | set(initial_text) | set(final_text)
     documents: list[dict[str, Any]] = []
@@ -448,23 +778,46 @@ def extract_wacz_content(wacz_path: Path, output_dir: Path) -> dict[str, Any]:
             }
         )
 
+    published_dates = [str(post.get("published_at") or "") for post in posts if post.get("published_at")]
+    if validation_status in {"rate_limited_partial", "invalid_partial"}:
+        completeness_status = "partial"
+    elif posts:
+        completeness_status = "best_effort_no_errors_observed"
+    else:
+        completeness_status = "unknown_no_structured_posts"
     bundle = {
-        "format": "social-profile-content-1.0",
+        "format": "social-profile-content-2.0",
         "source_wacz": str(wacz_path.resolve()),
+        "platform": platform,
+        "requested_period": {"start": period_start, "end": period_end},
+        "completeness_status": completeness_status,
+        "posts": posts,
+        "post_count": len(posts),
+        "oldest_post_at": min(published_dates) if published_dates else "",
+        "newest_post_at": max(published_dates) if published_dates else "",
         "documents": documents,
         "media": media,
         "document_count": len(documents),
         "media_count": len(media),
         "notes": [
-            "Text is Browsertrix page text, not a guaranteed one-record-per-post export.",
-            "Media contains captured image responses and can include profile or interface images as well as post graphics.",
+            "Structured posts are extracted from archived platform responses when available; page text remains as a replay/QA fallback.",
+            "Completeness is best-effort because a platform may stop returning older results without an explicit error.",
+            "For Facebook and X, copied media is limited to image URLs associated with extracted posts when structured records are available.",
         ],
     }
     content_path = output_dir / "content.json"
     content_path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
+    posts_csv_path = output_dir / "posts.csv"
+    if posts:
+        _write_posts_csv(posts_csv_path, posts)
     return {
         "content_path": str(content_path.resolve()),
         "content_dir": str(output_dir.resolve()),
+        "posts_csv_path": str(posts_csv_path.resolve()) if posts else "",
+        "post_count": len(posts),
+        "oldest_post_at": bundle["oldest_post_at"],
+        "newest_post_at": bundle["newest_post_at"],
+        "completeness_status": completeness_status,
         "document_count": len(documents),
         "media_count": len(media),
     }

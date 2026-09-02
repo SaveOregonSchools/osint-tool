@@ -25,7 +25,8 @@ The current integrations cover:
 - Browser-assisted LinkedIn profile/evidence capture for pages visible to a
   logged-in browser session you control.
 - Browsertrix WACZ archiving for user-supplied Facebook, Instagram, and X
-  targets, including date-bounded X searches and separate yearly collections.
+  targets, including a Facebook historical-post preset, date-bounded X searches,
+  quarterly/monthly batching, and structured post/image exports.
 - Public webpage technology and data-flow inspection, with static HTML analysis
   and optional rendered network, cookie-name, and storage-key observation.
 

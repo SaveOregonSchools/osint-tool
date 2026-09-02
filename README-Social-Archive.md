@@ -8,20 +8,27 @@ platform password.
 
 ## What It Archives
 
-- Facebook profile, Page, group, post, photo, and reel URLs.
+- Facebook profile, Page, and group timelines using the Historical posts preset.
 - Instagram profile, post, reel, story, and highlight URLs.
 - X account history through generated `from:account` searches.
 - Custom X search expressions, including other supported X search operators.
 
 Every Facebook and Instagram input URL gets a separate Browsertrix collection.
-X searches can be split into one collection per calendar year. Each collection
+X searches are split into one collection per calendar quarter by default, with
+monthly, yearly, and single-range options. Each collection
 has independent page, elapsed-time, and size limits, preventing one target or
-year from producing an unbounded archive.
+period from producing an unbounded archive.
 
-Facebook and Instagram do not expose an equivalent date-bounded feed URL, so
-the initial module does not claim to separate those feeds by publication year.
-Use individual post URLs or shorter target lists when narrower captures are
-required.
+Facebook and X use local custom Browsertrix behaviors optimized for posts and
+attached images. They do not queue individual post pages, comments, reactions,
+photo-grid pages, reels, or videos. Video CDN requests are blocked, autoplay is
+disabled, and final screenshots are off by default. Facebook post text is
+expanded when a visible **See more** control is present. Both behaviors track
+unique post IDs and stop after repeated scrolls yield no new posts.
+
+Facebook and Instagram do not expose an equivalent date-bounded feed URL. The
+module reports the oldest and newest structured Facebook posts it observed, but
+does not treat that range as proof that Facebook returned the complete history.
 
 ## Prerequisites
 
@@ -143,8 +150,9 @@ hang on 2FA and could expose an unattended browser service.
 
 1. Select **Plan and validate only**.
 2. Enter Facebook/Instagram URLs and/or X account handles.
-3. For X, select an inclusive start and end date. Keep yearly batching enabled
-   for long periods.
+3. For X, select an inclusive start and end date. Keep **Quarterly** batching
+   for the first run. Use **Monthly** for a busy account or to rerun only a
+   quarter that was marked partial because of rate limiting.
 4. Run the plan and review every generated target and date period.
 5. Select the green **Run Archiving** button below a successful plan. It preserves
    the submitted settings and queues the plan without requiring another dropdown
@@ -152,7 +160,8 @@ hang on 2FA and could expose an unattended browser service.
    Each platform/year batch becomes a persistent background job and the module
    returns immediately.
 6. Open **Jobs** in the app header to follow queued, running, completed, and
-   failed work. The page reports the verified X session state/account and, when
+   failed work. The page reports structured post count, oldest/newest observed
+   dates, best-effort coverage status, and the verified X session state/account. When
    needed, expands to show exact reauthentication and SSH-tunnel instructions.
    It refreshes automatically while work is active. If X
    returns a rate limit before any timeline data, the job and other X jobs using
@@ -160,7 +169,7 @@ hang on 2FA and could expose an unattended browser service.
    up to three times. Other queued platforms can continue while X is deferred.
 7. Use **Open output folder** beside a finished job to open its run directory
    in Windows Explorer.
-8. Replay every WACZ and verify that expected posts, comments, and media were
+8. Replay every WACZ and verify that expected posts, text, and images were
    captured before treating it as evidence.
 
 For an X range of January 1 through December 31, 2024, the module generates:
@@ -169,8 +178,15 @@ For an X range of January 1 through December 31, 2024, the module generates:
 from:example since:2024-01-01 until:2025-01-01
 ```
 
-The module owns the `since:` and `until:` terms to keep yearly batches
+The module owns the `since:` and `until:` terms to keep all batches
 non-overlapping. Do not add those two operators to custom X expressions.
+
+The optimized defaults are 900 seconds of behavior time, 1,500 seconds total,
+10 browser pages, a 512 MB WACZ limit, final text enabled, final screenshots
+disabled, content-check failures enabled, and working-file retention disabled.
+Because the Facebook and X presets scroll one search/timeline page instead of
+queuing comments and media pages, the page limit is a safety ceiling rather
+than a collection-depth target.
 
 ## Outputs
 
@@ -180,13 +196,23 @@ Capture attempts are stored under:
 data/social_media_archive/runs/<run-id>/
 ```
 
-By default, every attempt that produced a structurally valid WACZ contains only:
+By default, every attempt that produced a structurally valid WACZ contains:
 
 - `plan.json`, recording targets and crawl settings;
 - `manifest.json`, recording per-batch status, validation, crawler command and
   return code, retry provenance, compaction details, and output metadata;
 - one self-contained WACZ file;
-- a SHA-256 hash for the WACZ in the manifest.
+- a SHA-256 hash for the WACZ in the manifest; and
+- `content/content.json` plus `content/posts.csv` when structured posts were
+  found, with attached post images copied under `content/media/`.
+
+For X, structured extraction prefers the complete long-form Note Tweet text
+over the shortened legacy text and filters account searches to the requested
+`from:` handle. For Facebook, it extracts target-authored Story records returned
+for the requested Page/profile timeline. The manifest and Jobs page record the
+post count, oldest/newest observed timestamps, and a completeness status. A
+status of `best_effort_no_errors_observed` means the crawler saw no explicit
+error; it does not prove the platform exposed every historical post.
 
 An X attempt stopped by authentication preflight contains only `plan.json` and
 `manifest.json`; no archive WACZ or redundant crawler workspace is created.
@@ -207,14 +233,11 @@ Browsertrix working files** to keep them for every attempt. If filesystem locks
 or permissions prevent cleanup, the job is marked failed rather than claiming
 that the compact output contract was met.
 
-If X returns a rate limit after some timeline pages were captured, the WACZ is
-preserved but marked partial/failed. The module does not blindly restart a busy
-date range from the top because that can exhaust the same quota repeatedly.
-Retry that target with a narrower date range after the shared throttle clears.
-
-Automation profile-review jobs additionally create their requested extracted
-text/media bundle. The three-file compact layout describes ordinary archive
-captures.
+If X returns a rate limit after some timeline pages were captured, the WACZ and
+any extracted posts are preserved but marked partial/failed. The module does not
+blindly restart a busy date range from the top because that can exhaust the same
+quota repeatedly. Rerun only the affected period with **Monthly** batching after
+the shared throttle clears.
 
 Queue metadata is stored in `data/job_queue.sqlite`, which is also ignored by
 Git. Jobs are run serially so multiple Browsertrix containers do not compete for
@@ -256,18 +279,18 @@ for X automation when the job must verify a particular logged-in crawler
 account before collection.
 The workflow uses Browsertrix and the saved browser profile only. It does not
 read `X_BEARER_TOKEN`, call the X API, or incur X API request charges.
-Automation jobs use scrolling and media fetching without the regular archive
-module's social-site behavior, so they do not deliberately expand comment
-threads. Comments already visible in a platform feed may still appear in the
-extracted page text.
+Automation jobs use the same posts-and-attached-images behaviors as regular
+Facebook and X archives and do not deliberately expand comment threads.
 
 For X, the requested lookback is enforced in the generated search using
 `since:` and `until:`. Facebook and Instagram profile URLs do not expose a
 reliable publication-date cutoff, so their requested window is advisory: the
 crawler scrolls the visible feed within its configured time/page limits, and a
 later processing step must apply any date information present in the content.
-Browsertrix page text is not guaranteed to be one record per post, and the
-image bundle can include avatars or interface images along with post graphics.
+Browsertrix page text remains a replay/QA fallback. When platform response
+formats are recognized, `posts.csv` and the `posts` array in `content.json`
+provide one deduplicated record per post and media copying is restricted to
+image URLs associated with those records.
 
 ## Security and Collection Boundaries
 

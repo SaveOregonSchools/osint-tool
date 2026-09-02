@@ -47,6 +47,24 @@ class SocialMediaArchiveTests(unittest.TestCase):
             ],
         )
 
+    def test_quarter_and_month_periods_cover_partial_boundaries(self):
+        self.assertEqual(
+            inclusive_date_periods(date(2024, 2, 15), date(2024, 7, 4), "quarter"),
+            [
+                (date(2024, 2, 15), date(2024, 4, 1)),
+                (date(2024, 4, 1), date(2024, 7, 1)),
+                (date(2024, 7, 1), date(2024, 7, 5)),
+            ],
+        )
+        self.assertEqual(
+            inclusive_date_periods(date(2024, 11, 20), date(2025, 1, 3), "month"),
+            [
+                (date(2024, 11, 20), date(2024, 12, 1)),
+                (date(2024, 12, 1), date(2025, 1, 1)),
+                (date(2025, 1, 1), date(2025, 1, 4)),
+            ],
+        )
+
     def test_x_accounts_and_expressions_are_batched_by_year(self):
         plan = build_archive_plan(
             facebook_urls=["https://www.facebook.com/example"],
@@ -125,6 +143,10 @@ class SocialMediaArchiveTests(unittest.TestCase):
         self.assertEqual(command[command.index("--sizeLimit") + 1], str(512 * 1024 * 1024))
         profile_mount = command[command.index("-v", command.index("-v") + 1) + 1]
         self.assertTrue(profile_mount.endswith(":/profile/profile.tar.gz:ro"))
+        self.assertEqual(command[command.index("--behaviors") + 1], "autofetch,siteSpecific")
+        self.assertIn("--customBehaviors", command)
+        self.assertIn("/behaviors/x_historical_posts.js", command)
+        self.assertIn(r"https?://video\.twimg\.com/", command)
 
     def test_x_crawl_tuning_defaults_are_loaded_from_environment(self):
         environment = {
@@ -229,6 +251,9 @@ class SocialMediaArchiveTests(unittest.TestCase):
         self.assertNotIn("--postLoadDelay", command)
         self.assertIn("--ignoreScopeForBehaviorLinks", command)
         self.assertNotIn("--alwaysAddBehaviorLinks", command)
+        self.assertEqual(command[command.index("--behaviors") + 1], "autofetch,siteSpecific")
+        self.assertIn("/behaviors/facebook_historical_posts.js", command)
+        self.assertNotIn("autoplay", command)
 
     def test_x_auth_preflight_command_is_one_page_temporary_and_profile_read_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -321,6 +346,20 @@ class SocialMediaArchiveTests(unittest.TestCase):
         self.assertNotIn("auth_token", behavior)
         self.assertNotIn("x-csrf-token", behavior)
         self.assertNotIn("authorization", behavior.casefold())
+
+    def test_posts_and_images_behaviors_skip_comments_reels_and_video(self):
+        facebook = browsertrix_archive.FACEBOOK_HISTORICAL_BEHAVIOR.read_text(encoding="utf-8")
+        x_behavior = browsertrix_archive.X_HISTORICAL_BEHAVIOR.read_text(encoding="utf-8")
+
+        self.assertIn('return "Facebook"', facebook)
+        self.assertIn("facebook_historical_summary", facebook)
+        self.assertIn("see|show", facebook.casefold())
+        self.assertNotIn("addLink(", facebook)
+        self.assertNotIn("iterInfiniteScrollComments", facebook)
+        self.assertIn('return "Twitter"', x_behavior)
+        self.assertIn("pbs\\.twimg\\.com", x_behavior)
+        self.assertIn("x_historical_summary", x_behavior)
+        self.assertNotIn("addLink(", x_behavior)
 
     def test_x_auth_preflight_promotes_only_a_verified_refreshed_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1628,7 +1667,7 @@ class SocialMediaArchiveTests(unittest.TestCase):
         payload = enqueue.call_args.kwargs["payload"]
         self.assertFalse(payload["settings"]["save_final_screenshot"])
         self.assertTrue(payload["settings"]["extract_final_text"])
-        self.assertEqual(payload["settings"]["behaviors"], "autoscroll,autoplay,autofetch")
+        self.assertEqual(payload["settings"]["behaviors"], "autofetch,siteSpecific")
         self.assertIn("since:2026-07-19 until:2026-08-02", payload["batch"]["query_text"])
 
     def test_wacz_content_bundle_extracts_final_text_and_graphics(self):
@@ -1672,6 +1711,116 @@ class SocialMediaArchiveTests(unittest.TestCase):
             self.assertEqual(bundle["documents"][0]["text"], "Final post text")
             self.assertEqual(bundle["media_count"], 1)
             self.assertEqual(media_path.read_bytes(), image_body)
+
+    def test_x_content_bundle_uses_full_structured_text_and_only_attached_images(self):
+        def warc_record(record_type, target, content_type, body):
+            http_block = (
+                b"HTTP/1.1 200 OK\r\nContent-Type: "
+                + content_type.encode("ascii")
+                + b"\r\nContent-Length: "
+                + str(len(body)).encode("ascii")
+                + b"\r\n\r\n"
+                + body
+            )
+            headers = (
+                "WARC/1.1\r\n"
+                f"WARC-Type: {record_type}\r\n"
+                f"WARC-Target-URI: {target}\r\n"
+                "Content-Type: application/http\r\n"
+                f"Content-Length: {len(http_block)}\r\n\r\n"
+            ).encode("utf-8")
+            return headers + http_block + b"\r\n\r\n"
+
+        media_url = "https://pbs.twimg.com/media/example.jpg"
+        payload = {
+            "data": {
+                "search_by_raw_query": {
+                    "search_timeline": {
+                        "timeline": {
+                            "instructions": [
+                                {
+                                    "entries": [
+                                        {
+                                            "content": {
+                                                "itemContent": {
+                                                    "tweet_results": {
+                                                        "result": {
+                                                            "rest_id": "123456789",
+                                                            "core": {
+                                                                "user_results": {
+                                                                    "result": {
+                                                                        "legacy": {
+                                                                            "screen_name": "example",
+                                                                            "name": "Example Org",
+                                                                        }
+                                                                    }
+                                                                }
+                                                            },
+                                                            "note_tweet": {
+                                                                "note_tweet_results": {
+                                                                    "result": {"text": "The complete long-form post text."}
+                                                                }
+                                                            },
+                                                            "legacy": {
+                                                                "full_text": "Truncated text…",
+                                                                "created_at": "Wed Jan 03 16:02:30 +0000 2024",
+                                                                "extended_entities": {
+                                                                    "media": [
+                                                                        {
+                                                                            "type": "photo",
+                                                                            "media_url_https": media_url,
+                                                                        }
+                                                                    ]
+                                                                },
+                                                            },
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+        image_body = b"\x89PNG\r\n\x1a\nattached-image"
+        ui_image = b"\x89PNG\r\n\x1a\ninterface-image"
+        records = [
+            warc_record(
+                "response",
+                "https://x.com/i/api/graphql/hash/SearchTimeline?variables=test",
+                "application/json",
+                json.dumps(payload).encode("utf-8"),
+            ),
+            warc_record("response", media_url + "?name=large", "image/png", image_body),
+            warc_record("response", "https://abs.twimg.com/icons/ui.png", "image/png", ui_image),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wacz = root / "structured-x.wacz"
+            with zipfile.ZipFile(wacz, "w") as archive:
+                archive.writestr("pages/pages.jsonl", '{"format":"json-pages-1.0"}\n')
+                archive.writestr("archive/data.warc.gz", gzip.compress(b"".join(records)))
+            details = extract_wacz_content(
+                wacz,
+                root / "content",
+                platform="x",
+                expected_x_handle="example",
+                period_start="2024-01-01",
+                period_end="2024-03-31",
+            )
+            bundle = json.loads(Path(details["content_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(details["post_count"], 1)
+            self.assertEqual(bundle["posts"][0]["text"], "The complete long-form post text.")
+            self.assertEqual(bundle["posts"][0]["published_at"], "2024-01-03T16:02:30+00:00")
+            self.assertEqual(bundle["media_count"], 1)
+            self.assertIn("file", bundle["posts"][0]["media"][0])
+            self.assertTrue(Path(details["posts_csv_path"]).is_file())
 
 
 if __name__ == "__main__":

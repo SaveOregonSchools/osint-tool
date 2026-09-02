@@ -451,7 +451,7 @@ HOME_MENU = [
             (
                 "social_media_archive",
                 "Social Media Archive",
-                "Create authenticated Browsertrix WACZ archives for Facebook, Instagram, and X, with yearly X search batches.",
+                "Create focused Browsertrix post-and-image archives for Facebook and X, with smaller date-bounded X batches.",
             ),
             (
                 "web_page_inspector",
@@ -843,6 +843,10 @@ JOBS_HTML = LAYOUT_START + """
           {% if job.result.get('status') %}<b>{{ job.result.get('status') }}</b><br>{% endif %}
           {% if job.result.get('wacz_path') %}<code>{{ job.result.get('wacz_path') }}</code><br>{% endif %}
           {% if job.result.get('wacz_bytes') %}<span class="subtle">{{ job.result.get('wacz_bytes') }} bytes</span><br>{% endif %}
+          {% if job.result.get('content_path') %}
+            <span class="subtle">Posts: <b>{{ job.result.get('post_count', 0) }}</b>{% if job.result.get('oldest_post_at') %} · oldest {{ job.result.get('oldest_post_at') }}{% endif %}{% if job.result.get('newest_post_at') %} · newest {{ job.result.get('newest_post_at') }}{% endif %}</span><br>
+            <span class="subtle">Coverage: {{ job.result.get('completeness_status', 'unknown') }}</span><br>
+          {% endif %}
           {% if job.result.get('x_session_state') %}
             <span class="subtle">X session: <b>{{ job.result.get('x_session_state') }}</b>{% if job.result.get('x_account_handle') %} as @{{ job.result.get('x_account_handle') }}{% endif %}{% if job.result.get('x_auth_cache_hit') %} (cached){% endif %}</span><br>
           {% endif %}
