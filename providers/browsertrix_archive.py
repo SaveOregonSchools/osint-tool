@@ -24,13 +24,29 @@ from providers.wacz_content import XCaptureInspection, inspect_x_wacz
 
 DEFAULT_IMAGE = "webrecorder/browsertrix-crawler:1.14.3"
 DEFAULT_BEHAVIORS = "autoscroll,autoplay,autofetch,siteSpecific"
-PROFILE_REVIEW_BEHAVIORS = "autoscroll,autoplay,autofetch"
+POSTS_AND_IMAGES_BEHAVIORS = "autofetch,siteSpecific"
+PROFILE_REVIEW_BEHAVIORS = POSTS_AND_IMAGES_BEHAVIORS
 SUPPORTED_PLATFORMS = {"facebook", "instagram", "x"}
 X_RATE_LIMIT_MAX_RETRIES_ENV = "OSINT_X_RATE_LIMIT_MAX_RETRIES"
 X_RATE_LIMIT_INTERRUPT_COUNT_ENV = "OSINT_X_RATE_LIMIT_INTERRUPT_COUNT"
 X_POST_LOAD_DELAY_SECONDS_ENV = "OSINT_X_POST_LOAD_DELAY_SECONDS"
 X_AUTH_PREFLIGHT_URL = "https://x.com/settings/account"
 X_AUTH_PREFLIGHT_BEHAVIOR = Path(__file__).resolve().parent / "behaviors" / "x_auth_preflight.js"
+FACEBOOK_HISTORICAL_BEHAVIOR = (
+    Path(__file__).resolve().parent / "behaviors" / "facebook_historical_posts.js"
+)
+X_HISTORICAL_BEHAVIOR = Path(__file__).resolve().parent / "behaviors" / "x_historical_posts.js"
+PLATFORM_CUSTOM_BEHAVIORS = {
+    "facebook": FACEBOOK_HISTORICAL_BEHAVIOR,
+    "x": X_HISTORICAL_BEHAVIOR,
+}
+PLATFORM_BLOCK_RULES = {
+    "facebook": (
+        r"https?://video[^/]*\.fbcdn\.net/",
+        r"https?://[^/]+\.fbcdn\.net/[^?#]+\.(?:mp4|m4v|webm)(?:[?#]|$)",
+    ),
+    "x": (r"https?://video\.twimg\.com/",),
+}
 X_AUTH_INDETERMINATE_CACHE_SECONDS = 5 * 60
 X_PROFILE_MAX_MEMBERS = 100_000
 X_PROFILE_MAX_EXPANDED_BYTES = 16 * 1024 * 1024 * 1024
@@ -59,17 +75,18 @@ class ArchiveBatch:
     query_text: str = ""
     period_start: str = ""
     period_end: str = ""
+    period_granularity: str = ""
 
 
 @dataclass(frozen=True)
 class CrawlSettings:
     image: str = DEFAULT_IMAGE
     behaviors: str = DEFAULT_BEHAVIORS
-    behavior_timeout_seconds: int = 600
-    time_limit_seconds: int = 1800
-    page_limit: int = 250
-    size_limit_mb: int = 2048
-    save_final_screenshot: bool = True
+    behavior_timeout_seconds: int = 900
+    time_limit_seconds: int = 1500
+    page_limit: int = 10
+    size_limit_mb: int = 512
+    save_final_screenshot: bool = False
     extract_final_text: bool = True
     fail_on_content_check: bool = True
     retain_working_files: bool = False
@@ -125,6 +142,11 @@ class ArchiveResult:
     reauthentication_command: str = ""
     reauthentication_profile_filename: str = ""
     ssh_tunnel_command: str = ""
+    content_path: str = ""
+    post_count: int = 0
+    oldest_post_at: str = ""
+    newest_post_at: str = ""
+    completeness_status: str = ""
 
 
 @dataclass(frozen=True)
@@ -166,16 +188,30 @@ def inclusive_date_periods(start: date, end: date, batch_mode: str) -> list[tupl
     if end < start:
         raise ValueError("X end date must be on or after the start date.")
     final_exclusive = end + timedelta(days=1)
-    if batch_mode == "single":
+    normalized_mode = str(batch_mode or "quarter").casefold().strip()
+    if normalized_mode == "auto":
+        normalized_mode = "quarter"
+    if normalized_mode == "single":
         return [(start, final_exclusive)]
-    if batch_mode != "year":
-        raise ValueError("Batch mode must be 'year' or 'single'.")
+    if normalized_mode not in {"year", "quarter", "month"}:
+        raise ValueError("Batch mode must be 'auto', 'quarter', 'month', 'year', or 'single'.")
 
     periods: list[tuple[date, date]] = []
     cursor = start
     while cursor < final_exclusive:
-        next_year = date(cursor.year + 1, 1, 1)
-        period_end = min(next_year, final_exclusive)
+        if normalized_mode == "year":
+            boundary = date(cursor.year + 1, 1, 1)
+        elif normalized_mode == "quarter":
+            next_quarter_month = ((cursor.month - 1) // 3 + 1) * 3 + 1
+            if next_quarter_month > 12:
+                boundary = date(cursor.year + 1, 1, 1)
+            else:
+                boundary = date(cursor.year, next_quarter_month, 1)
+        elif cursor.month == 12:
+            boundary = date(cursor.year + 1, 1, 1)
+        else:
+            boundary = date(cursor.year, cursor.month + 1, 1)
+        period_end = min(boundary, final_exclusive)
         periods.append((cursor, period_end))
         cursor = period_end
     return periods
@@ -235,7 +271,7 @@ def build_x_search_query(base_query: str, start: date, end_exclusive: date) -> s
         raise ValueError("An X search expression cannot be blank.")
     if re.search(r"(?:^|\s)(?:since|until):", query, flags=re.I):
         raise ValueError(
-            "Do not include since: or until: in X search expressions; use the module date fields so yearly batches do not overlap."
+            "Do not include since: or until: in X search expressions; use the module date fields so batches do not overlap."
         )
     return f"{query} since:{start.isoformat()} until:{end_exclusive.isoformat()}"
 
@@ -323,6 +359,7 @@ def build_archive_plan(
                         query_text=query,
                         period_start=start.isoformat(),
                         period_end=(end_exclusive - timedelta(days=1)).isoformat(),
+                        period_granularity=("quarter" if batch_mode == "auto" else batch_mode),
                     )
                 )
 
@@ -378,7 +415,14 @@ def build_docker_command(
         if image_version is not None and image_version < (1, 14, 0)
         else "--alwaysAddBehaviorLinks"
     )
-    behaviors = str(settings.behaviors or DEFAULT_BEHAVIORS).strip()
+    custom_behavior = PLATFORM_CUSTOM_BEHAVIORS.get(batch.platform)
+    if custom_behavior is not None and not custom_behavior.is_file():
+        raise RuntimeError(f"The required {batch.platform} Browsertrix behavior file is missing: {custom_behavior}")
+    behaviors = (
+        POSTS_AND_IMAGES_BEHAVIORS
+        if custom_behavior is not None
+        else str(settings.behaviors or DEFAULT_BEHAVIORS).strip()
+    )
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:,[A-Za-z][A-Za-z0-9]*)*", behaviors):
         raise ValueError("Browsertrix behaviors contain unsupported characters.")
     command = [
@@ -391,31 +435,46 @@ def build_docker_command(
         f"{run_dir.resolve()}:/crawls",
         "-v",
         f"{profile_path.resolve()}:/profile/profile.tar.gz:ro",
-        image,
-        "crawl",
-        "--url",
-        batch.seed_url,
-        "--generateWACZ",
-        "--collection",
-        batch.collection,
-        "--scopeType",
-        "page-spa",
-        "--workers",
-        "1",
-        "--behaviors",
-        behaviors,
-        behavior_links_option,
-        "--profile",
-        "/profile/profile.tar.gz",
-        "--behaviorTimeout",
-        str(settings.behavior_timeout_seconds),
-        "--timeLimit",
-        str(settings.time_limit_seconds),
-        "--pageLimit",
-        str(settings.page_limit),
-        "--sizeLimit",
-        str(settings.size_limit_mb * 1024 * 1024),
     ]
+    if custom_behavior is not None:
+        command.extend(
+            [
+                "-v",
+                f"{custom_behavior.resolve()}:/behaviors/{custom_behavior.name}:ro",
+            ]
+        )
+    command.extend(
+        [
+            image,
+            "crawl",
+            "--url",
+            batch.seed_url,
+            "--generateWACZ",
+            "--collection",
+            batch.collection,
+            "--scopeType",
+            "page-spa",
+            "--workers",
+            "1",
+            "--behaviors",
+            behaviors,
+            behavior_links_option,
+            "--profile",
+            "/profile/profile.tar.gz",
+            "--behaviorTimeout",
+            str(settings.behavior_timeout_seconds),
+            "--timeLimit",
+            str(settings.time_limit_seconds),
+            "--pageLimit",
+            str(settings.page_limit),
+            "--sizeLimit",
+            str(settings.size_limit_mb * 1024 * 1024),
+        ]
+    )
+    if custom_behavior is not None:
+        command.extend(["--customBehaviors", f"/behaviors/{custom_behavior.name}"])
+    for block_rule in PLATFORM_BLOCK_RULES.get(batch.platform, ()):
+        command.extend(["--blockRules", block_rule])
     if settings.save_final_screenshot:
         command.extend(["--screenshot", "fullPageFinal"])
     if settings.extract_final_text:
