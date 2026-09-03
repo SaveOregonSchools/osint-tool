@@ -132,6 +132,8 @@ class SocialMediaArchiveTests(unittest.TestCase):
         self.assertIn("webrecorder/browsertrix-crawler:1.14.3", command)
         self.assertIn("--alwaysAddBehaviorLinks", command)
         self.assertIn("--failOnContentCheck", command)
+        self.assertEqual(command.count("--rateLimitStatusCodes"), 1)
+        self.assertEqual(command[command.index("--rateLimitStatusCodes") + 1], "429")
         self.assertIn("--rateLimitOnMatch", command)
         self.assertEqual(command.count("--rateLimitOnMatch"), 2)
         self.assertEqual(command[command.index("--rateLimitInterruptCount") + 1], "-1")
@@ -191,6 +193,7 @@ class SocialMediaArchiveTests(unittest.TestCase):
         self.assertIn("--ignoreScopeForBehaviorLinks", command)
         self.assertNotIn("--alwaysAddBehaviorLinks", command)
         self.assertEqual(command[command.index("--postLoadDelay") + 1], "10")
+        self.assertNotIn("--rateLimitStatusCodes", command)
         self.assertNotIn("--rateLimitOnMatch", command)
         self.assertNotIn("--rateLimitMaxRetries", command)
         self.assertNotIn("--rateLimitInterruptCount", command)
@@ -227,6 +230,7 @@ class SocialMediaArchiveTests(unittest.TestCase):
             )
 
         self.assertIn("--rateLimitOnMatch", command)
+        self.assertEqual(command[command.index("--rateLimitStatusCodes") + 1], "429")
 
     def test_non_x_command_does_not_add_x_rate_limit_flags(self):
         batch = ArchiveBatch(
@@ -255,6 +259,33 @@ class SocialMediaArchiveTests(unittest.TestCase):
         self.assertIn("/behaviors/facebook_historical_posts.js", command)
         self.assertNotIn("autoplay", command)
 
+    def test_non_x_1_14_command_uses_429_only_without_x_rate_limit_flags(self):
+        batch = ArchiveBatch(
+            batch_id="batch-0001",
+            platform="facebook",
+            label="example",
+            seed_url="https://www.facebook.com/example",
+            collection="facebook-example",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = build_docker_command(
+                docker_executable="docker",
+                run_dir=root / "run",
+                profile_path=root / "profile.tar.gz",
+                batch=batch,
+                settings=CrawlSettings(image="webrecorder/browsertrix-crawler:1.14.3"),
+                container_name="facebook-current-test",
+            )
+
+        self.assertEqual(command.count("--rateLimitStatusCodes"), 1)
+        self.assertEqual(command[command.index("--rateLimitStatusCodes") + 1], "429")
+        self.assertNotIn("--rateLimitOnMatch", command)
+        self.assertNotIn("--rateLimitMaxRetries", command)
+        self.assertNotIn("--rateLimitInterruptCount", command)
+        self.assertNotIn("--rateLimitTimeout", command)
+        self.assertIn("--alwaysAddBehaviorLinks", command)
+
     def test_x_auth_preflight_command_is_one_page_temporary_and_profile_read_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -272,6 +303,8 @@ class SocialMediaArchiveTests(unittest.TestCase):
         self.assertNotIn("--dryRun", command)
         self.assertIn("--failOnContentCheck", command)
         self.assertIn("--saveProfile", command)
+        self.assertEqual(command.count("--rateLimitStatusCodes"), 1)
+        self.assertEqual(command[command.index("--rateLimitStatusCodes") + 1], "429")
         self.assertEqual(command[command.index("--pageLimit") + 1], "1")
         self.assertEqual(command[command.index("--scopeType") + 1], "page")
         self.assertEqual(command[command.index("--behaviors") + 1], "siteSpecific")
@@ -297,6 +330,7 @@ class SocialMediaArchiveTests(unittest.TestCase):
 
         self.assertIn("webrecorder/browsertrix-crawler:1.13.2", command)
         self.assertIn("--postLoadDelay", command)
+        self.assertNotIn("--rateLimitStatusCodes", command)
         self.assertNotIn("--rateLimitOnMatch", command)
 
     def test_interactive_profile_reopen_command_is_loopback_only_and_stages_new_file(self):

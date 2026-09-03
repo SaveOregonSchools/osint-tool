@@ -26,6 +26,7 @@ DEFAULT_IMAGE = "webrecorder/browsertrix-crawler:1.14.3"
 DEFAULT_BEHAVIORS = "autoscroll,autoplay,autofetch,siteSpecific"
 POSTS_AND_IMAGES_BEHAVIORS = "autofetch,siteSpecific"
 PROFILE_REVIEW_BEHAVIORS = POSTS_AND_IMAGES_BEHAVIORS
+RATE_LIMIT_STATUS_CODES = (429,)
 SUPPORTED_PLATFORMS = {"facebook", "instagram", "x"}
 X_RATE_LIMIT_MAX_RETRIES_ENV = "OSINT_X_RATE_LIMIT_MAX_RETRIES"
 X_RATE_LIMIT_INTERRUPT_COUNT_ENV = "OSINT_X_RATE_LIMIT_INTERRUPT_COUNT"
@@ -384,6 +385,11 @@ def browsertrix_image_version(image: str) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in match.groups()) if match is not None else None
 
 
+def browsertrix_supports_rate_limit_options(image: str) -> bool:
+    version = browsertrix_image_version(image)
+    return version is None or version >= (1, 14, 0)
+
+
 def validate_x_image(image: str) -> str:
     value = validate_image_name(image)
     version = browsertrix_image_version(value)
@@ -409,7 +415,7 @@ def build_docker_command(
         else validate_image_name(settings.image)
     )
     image_version = browsertrix_image_version(image)
-    supports_rate_limit_options = image_version is None or image_version >= (1, 14, 0)
+    supports_rate_limit_options = browsertrix_supports_rate_limit_options(image)
     behavior_links_option = (
         "--ignoreScopeForBehaviorLinks"
         if image_version is not None and image_version < (1, 14, 0)
@@ -471,6 +477,10 @@ def build_docker_command(
             str(settings.size_limit_mb * 1024 * 1024),
         ]
     )
+    if supports_rate_limit_options:
+        command.extend(
+            ["--rateLimitStatusCodes", *(str(code) for code in RATE_LIMIT_STATUS_CODES)]
+        )
     if custom_behavior is not None:
         command.extend(["--customBehaviors", f"/behaviors/{custom_behavior.name}"])
     for block_rule in PLATFORM_BLOCK_RULES.get(batch.platform, ()):
@@ -658,7 +668,8 @@ def build_x_auth_preflight_command(
     container_name: str,
 ) -> list[str]:
     """Build a one-page X session verification crawl in temporary storage."""
-    return [
+    validated_image = validate_x_image(image)
+    command = [
         docker_executable,
         "run",
         "--rm",
@@ -670,7 +681,7 @@ def build_x_auth_preflight_command(
         f"{profile_path.resolve()}:/profile/profile.tar.gz:ro",
         "-v",
         f"{behavior_path.resolve()}:/behaviors/x_auth_preflight.js:ro",
-        validate_x_image(image),
+        validated_image,
         "crawl",
         "--url",
         X_AUTH_PREFLIGHT_URL,
@@ -701,6 +712,11 @@ def build_x_auth_preflight_command(
         "--failOnFailedSeed",
         "--failOnContentCheck",
     ]
+    if browsertrix_supports_rate_limit_options(validated_image):
+        command.extend(
+            ["--rateLimitStatusCodes", *(str(code) for code in RATE_LIMIT_STATUS_CODES)]
+        )
+    return command
 
 
 def _profile_fingerprint(profile_path: Path) -> tuple[str, int, int]:
